@@ -1,0 +1,39 @@
+[package]
+name = "usage-monitor"
+version = "0.2.0"
+edition = "2021"
+description = "Real-time Claude + Codex usage floating window for Windows"
+
+[[bin]]
+name = "usage-monitor"
+path = "src/main.rs"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_Globalization",
+    "Win32_System_Registry",
+    "Win32_Security",
+] }
+
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+log = "0.4"
+simplelog = "0.12"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

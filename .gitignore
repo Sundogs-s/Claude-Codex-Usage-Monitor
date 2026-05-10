@@ -1,0 +1,10 @@
+﻿/target/
+**/*.pdb
+usage-monitor.log
+.DS_Store
+Thumbs.db
+.codex/
+.tmp_upstream/
+extracted_zip/
+_runtime_logs/
+*.zip
