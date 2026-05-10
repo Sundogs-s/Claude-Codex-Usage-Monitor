@@ -7,6 +7,14 @@
 ### 项目简介
 `Claude Codex Usage Monitor` 是一个 Windows 桌面实时用量监控工具，用于展示 Claude Code 与 Codex 的使用率与重置倒计时。
 
+### 界面截图
+
+#### 悬浮窗模式
+![Window Mode](./window.png)
+
+#### AppBar 模式
+![AppBar Mode](./AppBar.png)
+
 ### 主要特性
 - 实时双通道监控：同时显示 Claude 与 Codex。
 - 多展示模式：支持悬浮窗与任务栏嵌入（AppBar）。
@@ -39,6 +47,14 @@ cargo build --release
 
 ### Overview
 `Claude Codex Usage Monitor` is a Windows desktop utility that shows real-time usage status for Claude Code and Codex, including utilization and reset countdowns.
+
+### Screenshots
+
+#### Floating Window Mode
+![Window Mode](./window.png)
+
+#### AppBar Mode
+![AppBar Mode](./AppBar.png)
 
 ### Features
 - Dual real-time monitoring for Claude and Codex.
