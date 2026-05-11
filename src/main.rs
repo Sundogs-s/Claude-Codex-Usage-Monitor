@@ -13,6 +13,7 @@
 
 mod claude;
 mod codex;
+mod cursor;
 mod monitor;
 mod overlay;
 mod state;
@@ -23,20 +24,23 @@ use simplelog::{CombinedLogger, Config, SharedLogger, WriteLogger};
 #[cfg(debug_assertions)]
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 use state::{
-    load_settings, new_shared, save_settings, DisplayMode, MonitorInfo, RefreshRate, SharedState,
+    calc_window_height, load_settings, new_shared, save_settings,
+    DisplayMode, MonitorInfo, RefreshRate, Settings, SharedState,
 };
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use windows::{
     core::{w, Result, PCWSTR},
     Win32::{
-        Foundation::{BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{BOOL, COLORREF, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
             CreateSolidBrush, EnumDisplayMonitors, GetMonitorInfoW, HDC, InvalidateRect,
             SetWindowRgn, HMONITOR, MONITORINFO,
         },
         System::{
+            DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard},
             LibraryLoader::GetModuleHandleW,
+            Memory::{GlobalLock, GlobalUnlock},
             Registry::{
                 RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
                 HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
@@ -55,10 +59,18 @@ use windows::{
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DEF_W: i32      = 320;
-const DEF_H: i32      = 200;
 const MIN_W: i32      = 240;
 const MIN_H: i32      = 132;   // single-section minimum
-const APPBAR_W: i32   = 360;   // widened to avoid cramped appbar text/progress on real taskbar
+// AppBar: each visible column is 180px wide; total width scales with n_visible_cols.
+const APPBAR_COL_W: i32 = 180;
+
+/// Compute the AppBar width from current settings (number of visible columns × 180px).
+fn appbar_width(settings: &Settings) -> i32 {
+    let n = (settings.show_claude as i32)
+          + (settings.show_codex  as i32)
+          + (settings.show_cursor as i32);
+    n.max(1) * APPBAR_COL_W
+}
 const TIMER_ID: usize = 1;
 const HOVER_TIMER_ID: usize = 2;
 const TRAY_UID: u32   = 1;
@@ -66,18 +78,20 @@ const WM_TRAY: u32    = WM_USER + 1;
 const WM_APPBAR: u32  = WM_USER + 2;
 
 // Menu item IDs
-const IDM_SHOW_HIDE:      u32 = 100;
-const IDM_MODE_FLOAT:     u32 = 101;
-const IDM_MODE_APPBAR:    u32 = 103;
-const IDM_SHOW_TASKBAR:   u32 = 104;
-const IDM_HOVER_AUTOHIDE: u32 = 105;
-const IDM_SHOW_CLAUDE:    u32 = 110;
-const IDM_SHOW_CODEX:     u32 = 111;
-const IDM_REFRESH_5S:     u32 = 201;
-const IDM_REFRESH_1M:     u32 = 202;
-const IDM_REFRESH_5M:     u32 = 203;
-const IDM_MANUAL_REFRESH: u32 = 150;
-const IDM_AUTOSTART:      u32 = 301;
+const IDM_MODE_FLOAT:      u32 = 101;
+const IDM_MODE_APPBAR:     u32 = 103;
+const IDM_SHOW_TASKBAR:    u32 = 104;
+const IDM_HOVER_AUTOHIDE:  u32 = 105;
+const IDM_SHOW_CLAUDE:     u32 = 110;
+const IDM_SHOW_CODEX:      u32 = 111;
+const IDM_SHOW_CURSOR:     u32 = 112;
+const IDM_CURSOR_COOKIE:   u32 = 113;
+const IDM_CURSOR_CLR_COOKIE: u32 = 114;
+const IDM_REFRESH_5S:      u32 = 201;
+const IDM_REFRESH_1M:      u32 = 202;
+const IDM_REFRESH_5M:      u32 = 203;
+const IDM_MANUAL_REFRESH:  u32 = 150;
+const IDM_AUTOSTART:       u32 = 301;
 const IDM_EXIT:           u32 = 400;
 const IDM_MONITOR_BASE:   u32 = 500; // +index per monitor
 
@@ -150,13 +164,15 @@ fn enum_monitors() -> Vec<MonitorInfo> {
 
 // ─── Dynamic tray icon ────────────────────────────────────────────────────────
 fn update_tray_icon(hwnd: HWND, state: &SharedState) {
-    let (c5h, x5h, c_err, x_err) = {
+    let (c5h, x5h, c_err, x_err, cr_err, cr_pct) = {
         let s = state.lock();
         (
             s.claude.utilization_5h,
             s.codex.utilization_5h,
             s.claude_error.clone(),
             s.codex_error.clone(),
+            s.cursor_error.clone(),
+            s.cursor.auto_usage_pct,
         )
     };
 
@@ -168,16 +184,15 @@ fn update_tray_icon(hwnd: HWND, state: &SharedState) {
             return;
         }
 
-        // Build tooltip: "Claude 82% · Codex 38%"
+        // Build tooltip: "Claude 82% · Codex 38% · Cursor 73%"
         let tip = {
-            let c_str = c5h.map(|v| format!("{:.0}%", v * 100.0))
-                           .unwrap_or_else(|| "–".to_string());
-            let x_str = x5h.map(|v| format!("{:.0}%", v * 100.0))
-                           .unwrap_or_else(|| "–".to_string());
-            let err = if !c_err.is_empty() || !x_err.is_empty() {
+            let c_str  = c5h.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "–".to_string());
+            let x_str  = x5h.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "–".to_string());
+            let cr_str = cr_pct.map(|v| format!(" · Cursor {:.0}%", v * 100.0)).unwrap_or_default();
+            let err = if !c_err.is_empty() || !x_err.is_empty() || !cr_err.is_empty() {
                 " ⚠".to_string()
             } else { String::new() };
-            format!("Claude {} · Codex {}{}\0", c_str, x_str, err)
+            format!("Claude {} · Codex {}{}{}\0", c_str, x_str, cr_str, err)
         };
 
         let mut nid = NOTIFYICONDATAW {
@@ -270,7 +285,7 @@ fn set_auto_start(enable: bool) {
 
 /// Register the window as a Shell AppBar and position it just left of the
 /// system tray area. Returns the taskbar height actually used.
-fn register_appbar(hwnd: HWND) -> i32 {
+fn register_appbar(hwnd: HWND, appbar_w: i32) -> i32 {
     unsafe {
         // Embed into taskbar as child window (more reliable than SHAppBarMessage docking).
         let taskbar_hwnd = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())
@@ -295,10 +310,10 @@ fn register_appbar(hwnd: HWND) -> i32 {
             if tray_hwnd.0 != std::ptr::null_mut() {
                 let mut tr = RECT::default();
                 GetWindowRect(tray_hwnd, &mut tr).ok();
-                tray_left = tr.left - APPBAR_W;
+                tray_left = tr.left - appbar_w;
             } else {
                 // Fallback to right edge of taskbar.
-                tray_left = taskbar_rect.right - APPBAR_W;
+                tray_left = taskbar_rect.right - appbar_w;
             }
 
             // Convert popup to child and attach to taskbar when needed.
@@ -314,11 +329,11 @@ fn register_appbar(hwnd: HWND) -> i32 {
             taskbar_h      = 40;
             taskbar_bottom = GetSystemMetrics(SM_CYSCREEN);
             taskbar_top    = taskbar_bottom - taskbar_h;
-            tray_left      = GetSystemMetrics(SM_CXSCREEN) - APPBAR_W;
+            tray_left      = GetSystemMetrics(SM_CXSCREEN) - appbar_w;
         }
         info!(
             "[appbar] pre-register taskbar_h={} top={} bottom={} tray_left={} appbar_w={}",
-            taskbar_h, taskbar_top, taskbar_bottom, tray_left, APPBAR_W
+            taskbar_h, taskbar_top, taskbar_bottom, tray_left, appbar_w
         );
 
         // Position child window. Embedded coordinates are relative to taskbar origin.
@@ -353,7 +368,7 @@ fn register_appbar(hwnd: HWND) -> i32 {
             let _ = GetWindowRect(taskbar_hwnd, &mut trc);
             let want_left = trc.left + x;
             let want_top = trc.top + y;
-            let want_right = want_left + APPBAR_W;
+            let want_right = want_left + appbar_w;
             let want_bottom = want_top + h;
             needs_move = wr.left != want_left
                 || wr.top != want_top
@@ -361,17 +376,17 @@ fn register_appbar(hwnd: HWND) -> i32 {
                 || wr.bottom != want_bottom;
         }
         if needs_move {
-            let moved = MoveWindow(hwnd, x, y, APPBAR_W, h, true).is_ok();
+            let moved = MoveWindow(hwnd, x, y, appbar_w, h, true).is_ok();
             info!(
                 "[appbar-debug-v3] MoveWindow applied={} child_xy=({}, {}) size=({},{})",
-                moved, x, y, APPBAR_W, h
+                moved, x, y, appbar_w, h
             );
             let _ = SetWindowPos(
                 hwnd,
                 HWND_TOP,
                 x,
                 y,
-                APPBAR_W,
+                appbar_w,
                 h,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
@@ -417,7 +432,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
     match settings.display_mode {
         DisplayMode::Floating => {
             let fw = settings.win_w.max(MIN_W);
-            let fh = settings.win_h.max(MIN_H);
+            let fh = if settings.win_h < MIN_H { calc_window_height(&settings) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
             unsafe {
@@ -440,7 +455,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
         DisplayMode::CompactBar => {
             // CompactBar mode removed: treat as Floating for backward-compatible settings.
             let fw = settings.win_w.max(MIN_W);
-            let fh = settings.win_h.max(MIN_H);
+            let fh = if settings.win_h < MIN_H { calc_window_height(&settings) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
             unsafe {
@@ -470,7 +485,8 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
                 SetWindowRgn(hwnd, None, true);
                 info!("[layout] switch->appbar exstyle={:#x} -> {:#x}", ex, new_ex);
             }
-            register_appbar(hwnd);
+            let aw = appbar_width(&settings);
+            register_appbar(hwnd, aw);
             unsafe {
                 InvalidateRect(hwnd, None, false).ok();
                 log_window_state("[layout] appbar applied", hwnd);
@@ -526,11 +542,19 @@ fn show_context_menu(hwnd: HWND, state: &SharedState) {
     unsafe {
         let hmenu = CreatePopupMenu().unwrap_or_default();
 
-        // ── Show Claude / Codex toggles (top of menu per design) ──────────
+        // ── Show Claude / Codex / Cursor toggles ──────────────────────────
         let fc = if settings.show_claude { MF_CHECKED } else { MF_UNCHECKED };
         let fx = if settings.show_codex  { MF_CHECKED } else { MF_UNCHECKED };
-        AppendMenuW(hmenu, MF_STRING | fc, IDM_SHOW_CLAUDE as usize, w!("显示 Claude")).ok();
-        AppendMenuW(hmenu, MF_STRING | fx, IDM_SHOW_CODEX  as usize, w!("显示 Codex")).ok();
+        let fcu = if settings.show_cursor { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(hmenu, MF_STRING | fc,  IDM_SHOW_CLAUDE  as usize, w!("显示 Claude")).ok();
+        AppendMenuW(hmenu, MF_STRING | fx,  IDM_SHOW_CODEX   as usize, w!("显示 Codex")).ok();
+        AppendMenuW(hmenu, MF_STRING | fcu, IDM_SHOW_CURSOR  as usize, w!("显示 Cursor")).ok();
+
+        // Cursor submenu: Cookie management
+        let h_cursor = CreatePopupMenu().unwrap_or_default();
+        AppendMenuW(h_cursor, MF_STRING, IDM_CURSOR_COOKIE     as usize, w!("粘贴 Cookie…")).ok();
+        AppendMenuW(h_cursor, MF_STRING, IDM_CURSOR_CLR_COOKIE as usize, w!("清除 Cookie")).ok();
+        AppendMenuW(hmenu, MF_POPUP, h_cursor.0 as usize, w!("Cursor 认证")).ok();
 
         AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
 
@@ -624,6 +648,7 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
                     v
                 };
                 info!("show_claude → {}", v);
+                resize_to_content(hwnd, state);
                 InvalidateRect(hwnd, None, false).ok();
             }
 
@@ -636,6 +661,49 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
                     v
                 };
                 info!("show_codex → {}", v);
+                resize_to_content(hwnd, state);
+                InvalidateRect(hwnd, None, false).ok();
+            }
+
+            IDM_SHOW_CURSOR => {
+                let v = {
+                    let mut s = state.lock();
+                    s.settings.show_cursor = !s.settings.show_cursor;
+                    let v = s.settings.show_cursor;
+                    save_settings(&s.settings);
+                    v
+                };
+                info!("show_cursor → {}", v);
+                // Immediately trigger a Cursor poll when enabling
+                if v { monitor::wake_pollers(); }
+                resize_to_content(hwnd, state);
+                InvalidateRect(hwnd, None, false).ok();
+            }
+
+            IDM_CURSOR_COOKIE => {
+                // Show an InputBox-style dialog via a simple Win32 message box prompt.
+                // We use a custom dialog defined below.
+                if let Some(cookie) = show_cookie_input_dialog(hwnd) {
+                    match cursor::save_cookie(&cookie) {
+                        Ok(()) => {
+                            info!("[menu] Cursor cookie saved ({} chars)", cookie.len());
+                            monitor::wake_pollers();
+                        }
+                        Err(e) => {
+                            error_msgbox(hwnd, &format!("保存 Cookie 失败:\n{}", e));
+                        }
+                    }
+                }
+            }
+
+            IDM_CURSOR_CLR_COOKIE => {
+                cursor::clear_cookie();
+                info!("[menu] Cursor cookie cleared");
+                {
+                    let mut s = state.lock();
+                    s.cursor = crate::state::CursorUsage::default();
+                    s.cursor_error = "Cookie 已清除".to_string();
+                }
                 InvalidateRect(hwnd, None, false).ok();
             }
 
@@ -725,6 +793,117 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
     }
 }
 
+// ─── Floating window auto-resize ──────────────────────────────────────────────
+/// Resize the floating window to the computed height for the currently-enabled
+/// sections. Does nothing in AppBar mode (size is fixed by the taskbar band).
+fn resize_to_content(hwnd: HWND, state: &SharedState) {
+    let (mode, settings) = {
+        let s = state.lock();
+        (s.settings.display_mode, s.settings.clone())
+    };
+    // AppBar: re-register with the new (possibly narrower/wider) width.
+    if mode == DisplayMode::AppBar {
+        register_appbar(hwnd, appbar_width(&settings));
+        return;
+    }
+    if mode != DisplayMode::Floating { return; }
+
+    let new_h = calc_window_height(&settings);
+    unsafe {
+        let mut wr = RECT::default();
+        GetWindowRect(hwnd, &mut wr).ok();
+        let cur_h = wr.bottom - wr.top;
+        let cur_w = wr.right - wr.left;
+        if cur_h == new_h { return; }
+
+        // Anchor to bottom-right: keep bottom + right edge fixed, grow/shrink upward
+        let new_top = wr.bottom - new_h;
+        SetWindowPos(hwnd, HWND_TOPMOST,
+            wr.left, new_top, cur_w, new_h,
+            SWP_NOACTIVATE).ok();
+        overlay::apply_rounded_region(hwnd, cur_w, new_h);
+
+        // Persist size
+        let mut s = state.lock();
+        s.settings.win_h = new_h;
+        s.settings.win_y = new_top;
+        save_settings(&s.settings);
+
+        info!("[resize] floating h {} → {}", cur_h, new_h);
+    }
+}
+
+// ─── Cursor Cookie input dialog ───────────────────────────────────────────────
+/// Show a simple Win32 InputBox-style dialog to collect the Cursor cookie string.
+/// Returns Some(cookie) if the user clicked OK with non-empty input, None otherwise.
+///
+/// Implementation: uses a small custom dialog window with an Edit control.
+fn show_cookie_input_dialog(parent: HWND) -> Option<String> {
+    // Build a simple dialog using TaskDialog-style MessageBox as a fallback.
+    // For a real InputBox we'd use a custom WNDPROC; here we use the clipboard
+    // approach: instruct the user to copy the cookie, then read it.
+    //
+    // We use a two-step approach:
+    //  1. Show instructions message box.
+    //  2. Read clipboard.
+    unsafe {
+        let msg = "请在浏览器中打开 cursor.com，\
+            按 F12 → Network → 任意请求 → Headers → Cookie，\
+            复制完整的 Cookie 字符串后，\
+            \n\n点击「确定」从剪贴板粘贴。\
+            \n（Cookie 仅保存在本机，不会上传）";
+        let msg_w: Vec<u16> = msg.encode_utf16().chain(Some(0)).collect();
+        let title_w: Vec<u16> = "Cursor Cookie\0".encode_utf16().collect();
+
+        let result = MessageBoxW(
+            parent,
+            PCWSTR(msg_w.as_ptr()),
+            PCWSTR(title_w.as_ptr()),
+            MB_OKCANCEL | MB_ICONINFORMATION,
+        );
+        if result == IDCANCEL { return None; }
+
+        // CF_UNICODETEXT = 13 (standard Windows clipboard format constant).
+        // GetClipboardData returns HANDLE; GlobalLock/Unlock require HGLOBAL —
+        // both are opaque isize wrappers, so we reinterpret via std::mem::transmute.
+        const CF_UNICODE: u32 = 13;
+        if OpenClipboard(parent).is_ok() {
+            let h = GetClipboardData(CF_UNICODE);
+            let cookie = if let Ok(handle) = h {
+                // Reinterpret HANDLE as HGLOBAL (same underlying type: isize).
+                let hglobal: HGLOBAL = std::mem::transmute(handle);
+                let ptr = GlobalLock(hglobal) as *const u16;
+                let cookie = if !ptr.is_null() {
+                    let mut len = 0usize;
+                    while *ptr.add(len) != 0 { len += 1; }
+                    let slice = std::slice::from_raw_parts(ptr, len);
+                    String::from_utf16_lossy(slice).trim().to_string()
+                } else { String::new() };
+                let _ = GlobalUnlock(hglobal);
+                cookie
+            } else { String::new() };
+            CloseClipboard().ok();
+
+            if !cookie.is_empty() && cookie.contains('=') {
+                return Some(cookie);
+            }
+            // Cookie looks invalid or clipboard was empty
+            let err_msg: Vec<u16> = "剪贴板内容为空或不像 Cookie 字符串（应包含 = 号）。\n请确认已复制正确内容后重试。\0"
+                .encode_utf16().collect();
+            MessageBoxW(parent, PCWSTR(err_msg.as_ptr()), PCWSTR(title_w.as_ptr()), MB_OK | MB_ICONWARNING);
+        }
+        None
+    }
+}
+
+fn error_msgbox(parent: HWND, msg: &str) {
+    unsafe {
+        let msg_w: Vec<u16> = format!("{}\0", msg).encode_utf16().collect();
+        let title_w: Vec<u16> = "Usage Monitor 错误\0".encode_utf16().collect();
+        MessageBoxW(parent, PCWSTR(msg_w.as_ptr()), PCWSTR(title_w.as_ptr()), MB_OK | MB_ICONERROR);
+    }
+}
+
 fn do_refresh(hwnd: HWND, state: &SharedState, rate: RefreshRate) {
     {
         let mut s = state.lock();
@@ -780,14 +959,23 @@ fn main() -> Result<()> {
         let (wx, wy, ww, wh) = match settings.display_mode {
             DisplayMode::Floating => {
                 let fw = settings.win_w.max(MIN_W);
-                let fh = settings.win_h.max(MIN_H);
+                // Use calc_window_height when win_h is -1 (auto) or from settings
+                let fh = if settings.win_h < MIN_H {
+                    calc_window_height(&settings)
+                } else {
+                    settings.win_h
+                };
                 let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
                 let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
                 (fx, fy, fw, fh)
             }
             DisplayMode::CompactBar => {
                 let fw = settings.win_w.max(MIN_W);
-                let fh = settings.win_h.max(MIN_H);
+                let fh = if settings.win_h < MIN_H {
+                    calc_window_height(&settings)
+                } else {
+                    settings.win_h
+                };
                 let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
                 let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
                 (fx, fy, fw, fh)
@@ -796,7 +984,8 @@ fn main() -> Result<()> {
             DisplayMode::AppBar => {
                 let screen_w = GetSystemMetrics(SM_CXSCREEN);
                 let screen_h = GetSystemMetrics(SM_CYSCREEN);
-                (screen_w - APPBAR_W, screen_h - 40, APPBAR_W, 40)
+                let aw = appbar_width(&settings);
+                (screen_w - aw, screen_h - 40, aw, 40)
             }
         };
 
@@ -843,7 +1032,7 @@ fn main() -> Result<()> {
 
         // AppBar registration (if starting in that mode)
         if settings.display_mode == DisplayMode::AppBar {
-            register_appbar(hwnd);
+            register_appbar(hwnd, appbar_width(&settings));
         }
 
         // Background polling
@@ -891,9 +1080,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             // ── 1-second timer → countdown repaint ────────────────────────
             WM_TIMER if wparam.0 == TIMER_ID => {
                 if let Some(sh) = get_state() {
-                    if sh.lock().settings.display_mode == DisplayMode::AppBar {
+                    let s = sh.lock();
+                    if s.settings.display_mode == DisplayMode::AppBar {
                         // Keep hugging tray left edge when tray icon count/width changes.
-                        register_appbar(hwnd);
+                        let aw = appbar_width(&s.settings);
+                        drop(s);
+                        register_appbar(hwnd, aw);
                     }
                 }
                 LRESULT(0)
@@ -943,9 +1135,12 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_APPBAR => {
                 // Re-register position if taskbar changes (e.g. auto-hide toggle)
                 if let Some(sh) = get_state() {
-                    if sh.lock().settings.display_mode == DisplayMode::AppBar {
+                    let s = sh.lock();
+                    if s.settings.display_mode == DisplayMode::AppBar {
                         info!("[appbar] WM_APPBAR received wparam={} lparam={}", wparam.0, lparam.0);
-                        register_appbar(hwnd);
+                        let aw = appbar_width(&s.settings);
+                        drop(s);
+                        register_appbar(hwnd, aw);
                         InvalidateRect(hwnd, None, false).ok();
                         log_window_state("[appbar] after WM_APPBAR relayout", hwnd);
                     }

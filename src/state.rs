@@ -15,6 +15,19 @@ pub struct WindowUsage {
     pub reset_7d:       Option<DateTime<Utc>>,
 }
 
+/// Cursor personal-plan usage snapshot.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CursorUsage {
+    /// Auto (cheaper) model budget used, 0.0–1.0.  From autoPercentUsed / 100.
+    pub auto_usage_pct: Option<f32>,
+    /// Named-model (API/premium) budget used, 0.0–1.0.  From apiPercentUsed / 100.
+    pub api_usage_pct:  Option<f32>,
+    /// Billing cycle end date.
+    pub reset_date:     Option<DateTime<Utc>>,
+    /// User email / name (best-effort).
+    pub user_email:     Option<String>,
+}
+
 // ─── Settings ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -23,7 +36,7 @@ pub enum DisplayMode {
     Floating,
     /// Compact bar floating above the taskbar (full monitor width)
     CompactBar,
-    /// Embedded in the Windows taskbar via AppBar API (300×taskbar-height)
+    /// Embedded in the Windows taskbar via AppBar API
     AppBar,
 }
 impl Default for DisplayMode { fn default() -> Self { Self::Floating } }
@@ -59,20 +72,25 @@ pub struct Settings {
     /// Whether to show Codex section (right-click menu toggle).
     #[serde(default = "default_true")]
     pub show_codex:      bool,
-    /// Saved position / size for floating mode.
+    /// Whether to show Cursor section (right-click menu toggle).
+    #[serde(default = "default_true")]
+    pub show_cursor:     bool,
+    /// Saved position for floating mode (-1 = auto-position).
     #[serde(default = "default_neg")]
     pub win_x: i32,
     #[serde(default = "default_neg")]
     pub win_y: i32,
+    /// Saved size — width is fixed at DEFAULT_W; height auto-computed
+    /// when any section toggle changes (win_h = -1 signals auto mode).
     #[serde(default = "default_win_w")]
     pub win_w: i32,
-    #[serde(default = "default_win_h")]
+    #[serde(default = "default_neg")]
     pub win_h: i32,
 }
+
 fn default_true()  -> bool { true }
 fn default_neg()   -> i32  { -1 }
 fn default_win_w() -> i32  { 320 }
-fn default_win_h() -> i32  { 200 }
 
 impl Default for Settings {
     fn default() -> Self {
@@ -85,10 +103,42 @@ impl Default for Settings {
             hover_auto_hide: false,
             show_claude:     true,
             show_codex:      true,
+            show_cursor:     true,
             win_x: -1, win_y: -1,
-            win_w: 320, win_h: 200,
+            win_w: 320, win_h: -1,   // -1 → auto-compute on first paint
         }
     }
+}
+
+// ─── Window height auto-sizing ────────────────────────────────────────────────
+//
+// Layout spec (floating mode):
+//   header:            28 px
+//   per-section:       80 px  (label row + 2 progress rows + padding)
+//   divider gap:        8 px  (between sections; N-1 dividers for N sections)
+//   bottom padding:    12 px
+//
+// Minimum height: 132 px (single section, matches MIN_H in main.rs)
+
+pub const SECTION_H:    i32 = 80;
+pub const HEADER_H:     i32 = 28;
+pub const DIVIDER_GAP:  i32 = 8;
+pub const BOTTOM_PAD:   i32 = 12;
+
+/// Compute the preferred floating-window height for the currently enabled sections.
+/// Returns at least 132 (MIN_H) so the window is never empty.
+pub fn calc_window_height(settings: &Settings) -> i32 {
+    let n = [settings.show_claude, settings.show_codex, settings.show_cursor]
+        .iter()
+        .filter(|&&v| v)
+        .count() as i32;
+
+    if n == 0 {
+        return 132;
+    }
+
+    let h = HEADER_H + n * SECTION_H + (n - 1) * DIVIDER_GAP + BOTTOM_PAD;
+    h.max(132)
 }
 
 // ─── Monitor info ─────────────────────────────────────────────────────────────
@@ -105,13 +155,15 @@ pub struct MonitorInfo {
 
 #[derive(Debug, Default)]
 pub struct AppState {
-    pub claude:       WindowUsage,
-    pub codex:        WindowUsage,
-    pub claude_error: String,
-    pub codex_error:  String,
+    pub claude:        WindowUsage,
+    pub codex:         WindowUsage,
+    pub cursor:        CursorUsage,
+    pub claude_error:  String,
+    pub codex_error:   String,
+    pub cursor_error:  String,
     pub floating_hover_hidden: bool,
-    pub settings:     Settings,
-    pub monitors:     Vec<MonitorInfo>,
+    pub settings:      Settings,
+    pub monitors:      Vec<MonitorInfo>,
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;

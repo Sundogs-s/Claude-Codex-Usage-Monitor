@@ -1,5 +1,5 @@
 /// Background monitor thread with dynamic refresh interval.
-use crate::{claude, codex, state::SharedState};
+use crate::{claude, codex, cursor, state::SharedState};
 use log::{error, info};
 use reqwest::Client;
 use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
@@ -11,17 +11,19 @@ use windows::Win32::{
 
 // ─── Global refresh control ───────────────────────────────────────────────────
 
-pub static CLAUDE_INTERVAL: AtomicU64 = AtomicU64::new(60);
-pub static CODEX_INTERVAL:  AtomicU64 = AtomicU64::new(65);
+pub static CLAUDE_INTERVAL:  AtomicU64 = AtomicU64::new(60);
+pub static CODEX_INTERVAL:   AtomicU64 = AtomicU64::new(65);
+pub static CURSOR_INTERVAL:  AtomicU64 = AtomicU64::new(70);
 pub static WAKE_POLLERS: Notify = Notify::const_new();
 
 pub fn set_refresh_secs(secs: u64) {
-    CLAUDE_INTERVAL.store(secs, Ordering::Relaxed);
-    CODEX_INTERVAL.store(secs + 5, Ordering::Relaxed);
+    CLAUDE_INTERVAL.store(secs,       Ordering::Relaxed);
+    CODEX_INTERVAL.store(secs + 5,   Ordering::Relaxed);
+    CURSOR_INTERVAL.store(secs + 10, Ordering::Relaxed);
     WAKE_POLLERS.notify_waiters();
 }
 
-/// Immediately wake both pollers without changing the refresh interval.
+/// Immediately wake all pollers without changing the refresh interval.
 pub fn wake_pollers() {
     WAKE_POLLERS.notify_waiters();
 }
@@ -49,7 +51,8 @@ pub fn spawn(state: SharedState, hwnd: HWND) {
                 .expect("HTTP client");
             tokio::join!(
                 poll_claude(Arc::clone(&state), hwnd, client.clone()),
-                poll_codex(Arc::clone(&state),  hwnd, client),
+                poll_codex(Arc::clone(&state),  hwnd, client.clone()),
+                poll_cursor(Arc::clone(&state), hwnd, client),
             );
         });
     });
@@ -125,6 +128,49 @@ async fn poll_codex(state: SharedState, hwnd: HWND, client: Client) {
             notify_repaint(hwnd);
         }
         let secs = CODEX_INTERVAL.load(Ordering::Relaxed);
+        tokio::select! {
+            _ = sleep(Duration::from_secs(secs)) => {}
+            _ = WAKE_POLLERS.notified() => {}
+        }
+    }
+}
+
+async fn poll_cursor(state: SharedState, hwnd: HWND, client: Client) {
+    // Stagger start by 10 s so all three pollers don't hit the network simultaneously.
+    sleep(Duration::from_secs(10)).await;
+    loop {
+        info!("[monitor] polling Cursor…");
+        let mut changed = false;
+
+        // Only hit the API when the section is visible.
+        let show_cursor = state.lock().settings.show_cursor;
+        if show_cursor {
+            match cursor::fetch(&client).await {
+                Ok(usage) => {
+                    let mut s = state.lock();
+                    if s.cursor != usage {
+                        s.cursor = usage;
+                        changed = true;
+                    }
+                    if !s.cursor_error.is_empty() {
+                        s.cursor_error = String::new();
+                        changed = true;
+                    }
+                }
+                Err(e) => {
+                    error!("[monitor] Cursor: {}", e);
+                    let mut s = state.lock();
+                    let next_err = e.to_string();
+                    if s.cursor_error != next_err {
+                        s.cursor_error = next_err;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if changed { notify_repaint(hwnd); }
+        let secs = CURSOR_INTERVAL.load(Ordering::Relaxed);
         tokio::select! {
             _ = sleep(Duration::from_secs(secs)) => {}
             _ = WAKE_POLLERS.notified() => {}

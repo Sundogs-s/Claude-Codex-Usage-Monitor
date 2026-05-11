@@ -1,25 +1,32 @@
 /// Modern GDI overlay painter.
 ///
-/// Floating mode (default 320 × 200):
+/// Floating mode (default 320 × auto-height):
 ///   ┌─────────────────────────────────────┐
 ///   │  USAGE MONITOR                   ● │  ← header 28px
 ///   ├─────────────────────────────────────┤
-///   │  ◆ CLAUDE                           │
+///   │  ◆ CLAUDE                           │  ← 80px section
 ///   │    5h  ████████████░░  82%  4h 23m  │
 ///   │    7d  █████░░░░░░░░░  41%  3d 12h  │
-///   ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  (dashed)
-///   │  ◆ CODEX                            │
+///   ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤  (dashed, 8px gap)
+///   │  ■ CODEX                            │  ← 80px section
 ///   │    5h  ████░░░░░░░░░░  35%  3h 07m  │
 ///   │    7d  ███████░░░░░░░  47%  4d 08h  │
+///   ├ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤
+///   │  ● CURSOR                           │  ← 80px section
+///   │   AUTO  ████████████░  73%   8d 2h  │
+///   │   API   ██░░░░░░░░░░░  15%   8d 2h  │
 ///   └─────────────────────────────────────┘
 ///
-/// AppBar-dock mode (300 × 40, embedded in taskbar):
-///   [◆C  5h ████ 82% 4h23m │ ◆X  5h ████ 35% 3h07m]
-///         7d ████ 41% 3d12h        7d ████ 22% 5d06h
+/// AppBar-dock mode (n×180 × 40, embedded in taskbar — n = visible columns):
+///   [◆C  5h ████ 82% 4h23m │ ■X  5h ████ 35% 3h07m │ ●CR AUTO ████ 73%]
+///         7d ████ 41% 3d12h        7d ████ 22% 5d06h       API  ██░░ 15%
 ///
 /// Compact-bar mode (full monitor width × 38px, floating above taskbar):
 ///   [◆ C  5h ███  82%  4h23m │ ◆ X  5h ██  35%  3h07m]
-use crate::state::{fmt_countdown, fmt_pct, secs_until, AppState, DisplayMode};
+use crate::state::{
+    fmt_countdown, fmt_pct, secs_until, AppState, DisplayMode,
+    SECTION_H, DIVIDER_GAP, BOTTOM_PAD,
+};
 use log::{debug, info};
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::{
@@ -46,12 +53,17 @@ const DIVIDER:      u32 = 0x2D3142;
 const TEXT_TITLE:   u32 = 0xCDD9E5;
 const TEXT_PRIMARY: u32 = 0xE6EDF3;
 const TEXT_DIM:     u32 = 0x8B949E;
-const CLAUDE_HI:    u32 = 0xFFC247;
-const CLAUDE_MID:   u32 = 0xF0A500;
-const CLAUDE_LO:    u32 = 0x9B6A00;
-const CODEX_HI:     u32 = 0x3DEFA0;
-const CODEX_MID:    u32 = 0x00B16A;
-const CODEX_LO:     u32 = 0x007045;
+const CLAUDE_HI:    u32 = 0xBE6143;
+const CLAUDE_MID:   u32 = 0x944B34;
+const CLAUDE_LO:    u32 = 0x5B2E20;
+const CODEX_HI:     u32 = 0x515FE4;
+const CODEX_MID:    u32 = 0x3F4AB1;
+const CODEX_LO:     u32 = 0x262D6D;
+// Cursor brand: light-grey theme
+const CURSOR_HI:     u32 = 0xF5F5F5;  // near-white (main text / icon)
+const CURSOR_MID:    u32 = 0xAAAAAA;  // light-mid grey (bar fill)
+const CURSOR_LO:     u32 = 0x606060;  // medium-dark grey (bar track tint / dim text)
+const CURSOR_STRIPE: u32 = 0xB0B0B0;  // light-grey accent stripe
 const WARN_HI:      u32 = 0xFF7B7B;
 const WARN_MID:     u32 = 0xF85149;
 const WARN_LO:      u32 = 0x9B2020;
@@ -149,47 +161,104 @@ unsafe fn paint_floating(hwnd: HWND, state: &AppState) {
     // Header bottom border — 1px #2D3142
     gdi_hline(hdc, 0, header_h, w, DIVIDER);
 
-    // Section layout: sections share remaining height equally
+    // ── Section layout: fixed SECTION_H (80px) per enabled section ───────────
     let show_claude = state.settings.show_claude;
     let show_codex  = state.settings.show_codex;
-    let n_sections = (show_claude as i32) + (show_codex as i32);
-    let content_h = h - header_h;
-    let section_h = if n_sections > 0 { content_h / n_sections } else { content_h };
+    let show_cursor = state.settings.show_cursor;
 
+    // Collect enabled sections.
+    // For Claude/Codex: label1="5h", label2="7d".
+    // For Cursor:       label1="AUTO", label2="API"  (both monthly, same reset_date).
+    struct SectionDef {
+        name:    &'static str,
+        hi:      u32,
+        mid:     u32,
+        lo:      u32,
+        label1:  &'static str,
+        u1:      Option<f32>,
+        s1:      i64,
+        label2:  &'static str,
+        u2:      Option<f32>,
+        s2:      i64,
+        is_cursor: bool,
+    }
+
+    let mut sections: Vec<SectionDef> = Vec::new();
+    if show_claude {
+        sections.push(SectionDef {
+            name: "Claude", hi: CLAUDE_HI, mid: CLAUDE_MID, lo: CLAUDE_LO,
+            label1: "5h", u1: state.claude.utilization_5h, s1: secs_until(state.claude.reset_5h),
+            label2: "7d", u2: state.claude.utilization_7d, s2: secs_until(state.claude.reset_7d),
+            is_cursor: false,
+        });
+    }
+    if show_codex {
+        sections.push(SectionDef {
+            name: "Codex", hi: CODEX_HI, mid: CODEX_MID, lo: CODEX_LO,
+            label1: "5h", u1: state.codex.utilization_5h, s1: secs_until(state.codex.reset_5h),
+            label2: "7d", u2: state.codex.utilization_7d, s2: secs_until(state.codex.reset_7d),
+            is_cursor: false,
+        });
+    }
+    if show_cursor {
+        let reset_secs = secs_until(state.cursor.reset_date);
+        sections.push(SectionDef {
+            name: "Cursor", hi: CURSOR_HI, mid: CURSOR_MID, lo: CURSOR_LO,
+            label1: "AUTO", u1: state.cursor.auto_usage_pct, s1: reset_secs,
+            label2: "API",  u2: state.cursor.api_usage_pct,  s2: reset_secs,
+            is_cursor: true,
+        });
+    }
+
+    let section_h = SECTION_H;
+    let divider_gap = DIVIDER_GAP;
     let mut sec_y = header_h;
 
-    if show_claude {
-        draw_float_section(
-            hdc, &fn_ui_bold, &fn_mono, fh_head, fh_row,
-            0, sec_y, w, section_h,
-            "Claude", CLAUDE_HI, CLAUDE_MID, CLAUDE_LO,
-            state.claude.utilization_5h, secs_until(state.claude.reset_5h),
-            state.claude.utilization_7d, secs_until(state.claude.reset_7d),
-        );
-        sec_y += section_h;
-
-        // Dashed divider between Claude and Codex sections
-        if show_codex {
+    for (idx, sec) in sections.iter().enumerate() {
+        // Dashed divider before each section except the first
+        if idx > 0 {
             let dash = 4i32;
             let gap  = 3i32;
             let pad  = 14i32;
+            let div_y = sec_y - divider_gap / 2;
             let mut dx = pad;
             while dx < w - pad {
                 let seg = (dx + dash).min(w - pad) - dx;
-                gdi_fill(hdc, dx, sec_y, seg, 1, DIVIDER);
+                gdi_fill(hdc, dx, div_y, seg, 1, DIVIDER);
                 dx += dash + gap;
             }
         }
-    }
 
-    if show_codex {
         draw_float_section(
             hdc, &fn_ui_bold, &fn_mono, fh_head, fh_row,
             0, sec_y, w, section_h,
-            "Codex", CODEX_HI, CODEX_MID, CODEX_LO,
-            state.codex.utilization_5h, secs_until(state.codex.reset_5h),
-            state.codex.utilization_7d, secs_until(state.codex.reset_7d),
+            sec.name, sec.hi, sec.mid, sec.lo,
+            sec.label1, sec.u1, sec.s1,
+            sec.label2, sec.u2, sec.s2,
+            sec.is_cursor,
         );
+
+        sec_y += section_h + divider_gap;
+    }
+
+    // Error banner at bottom (if any service has an error and section is visible)
+    {
+        let mut errors: Vec<&str> = Vec::new();
+        if show_claude && !state.claude_error.is_empty() { errors.push(&state.claude_error); }
+        if show_codex  && !state.codex_error.is_empty()  { errors.push(&state.codex_error); }
+        if show_cursor && !state.cursor_error.is_empty() { errors.push(&state.cursor_error); }
+
+        if !errors.is_empty() {
+            let err_y = h - BOTTOM_PAD - 10;
+            let hfr = make_font_weight(&fn_mono, fh_row - 1, 400);
+            let old_f = SelectObject(hdc, hfr);
+            SetTextColor(hdc, rgb(WARN_MID));
+            // Show first error only (space is limited)
+            gdi_text(hdc, errors[0], 14, err_y, w - 28, 10,
+                     DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, old_f);
+            DeleteObject(hfr);
+        }
     }
 
     EndPaint(hwnd, &ps);
@@ -197,9 +266,11 @@ unsafe fn paint_floating(hwnd: HWND, state: &AppState) {
 
 /// Draw one service section within the floating window.
 /// Spec: padding 8px top, 14px left/right, 8px bottom.
-/// Layout: heading row (diamond + name, 12.5pt/600, brand-light),
-///         then two rows (5h / 7d): label 16px | bar flex | pct 40px right | eta 44px
+/// Layout: heading row (icon + name, 12.5pt/600, brand-light),
+///         then two rows: label_w | bar flex | pct 40px right | eta 44px
 ///         bar height 8px, radius 4px.
+///
+/// is_cursor=true → use ● circle icon + wider label column (fits "AUTO"/"API").
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_float_section(
     hdc: HDC,
@@ -208,12 +279,15 @@ unsafe fn draw_float_section(
     sx: i32, sy: i32, sw: i32, sh: i32,
     name: &str,
     hi: u32, mid: u32, lo: u32,
-    u5h: Option<f32>, s5h: i64,
-    u7d: Option<f32>, s7d: i64,
+    label1: &str, u1: Option<f32>, s1: i64,
+    label2: &str, u2: Option<f32>, s2: i64,
+    is_cursor: bool,
 ) {
     let pad_x   = 14i32;
     let pad_top =  8i32;
-    let label_w = 16i32;
+    // Cursor labels "AUTO"/"API" are 4/3 ASCII chars — need ~36px at 9pt mono to render fully.
+    // Claude/Codex "5h"/"7d" fit in 16px.
+    let label_w = if is_cursor { 36i32 } else { 16i32 };
     let pct_w   = 40i32;
     let eta_w   = 44i32;
     let bar_h   =  8i32;
@@ -224,60 +298,66 @@ unsafe fn draw_float_section(
 
     let content_x = sx + pad_x;
     let content_w = sw - pad_x * 2;
-    let bar_w = content_w - label_w - 8 - pct_w - 4 - eta_w;
-    let bar_w = bar_w.max(20);
+    let bar_w = (content_w - label_w - 8 - pct_w - 4 - eta_w).max(20);
 
     let mut y = sy + pad_top;
 
-    // Heading: diamond icon + name text
-    let dia_cx = content_x + 5;
-    let dia_cy = y + head_h / 2;
-    draw_diamond(hdc, dia_cx, dia_cy, 5, hi);
+    // ── Heading icon ──────────────────────────────────────────────────────────
+    let icon_cx = content_x + 5;
+    let icon_cy = y + head_h / 2;
+    if is_cursor {
+        // ● filled circle (Cursor brand)
+        gdi_circle(hdc, icon_cx, icon_cy, 5, hi);
+    } else {
+        // ◆ rotated square (Claude / Codex brand)
+        draw_diamond(hdc, icon_cx, icon_cy, 5, hi);
+    }
 
+    // ── Heading name ──────────────────────────────────────────────────────────
     let hfh = make_font_weight(fn_bold, fh_head, 600);
     let old = SelectObject(hdc, hfh);
     SetTextColor(hdc, rgb(hi));
     gdi_text(hdc, name, content_x + 14, y, content_w - 14, head_h,
              DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
     SelectObject(hdc, old);
     DeleteObject(hfh);
     y += head_h + 4;
 
-    // Two data rows — centered in remaining section height
+    // ── Two data rows — vertically centred in remaining section space ─────────
     let rows_total = row_h * 2 + row_gap;
     let remaining = sh - (y - sy);
     if remaining > rows_total {
         y += (remaining - rows_total) / 2;
     }
 
-    for (label, util, secs) in [("5h", u5h, s5h), ("7d", u7d, s7d)] {
+    for (label, util, secs) in [(label1, u1, s1), (label2, u2, s2)] {
         let bx = content_x + label_w + 8;
         let by = y + (row_h - bar_h) / 2;
 
-        // Label: 16px wide, #CDD9E5, mono 600
         let hfm = make_font_weight(fn_mono, fh_row, 600);
         let old2 = SelectObject(hdc, hfm);
         SetTextColor(hdc, rgb(TEXT_TITLE));
         gdi_text(hdc, label, content_x, y, label_w, row_h,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        // Track
+        // Bar track
         gdi_rrect(hdc, bx, by, bar_w, bar_h, bar_r, BAR_TRACK);
-        // Fill
+        // Bar fill
         let fw = util.map(|u| ((u * bar_w as f32) as i32).max(0).min(bar_w)).unwrap_or(0);
         if fw > 0 {
             let (bhi, bmid, blo) = bar_colors(util, hi, mid, lo);
             gdi_grad_bar(hdc, bx, by, fw, bar_h, blo, bmid, bhi);
         }
 
-        // Pct: 40px right-aligned, warn color at ≥80%
+        // Percentage (warn ≥80%)
         let warn = util.unwrap_or(0.0) >= 0.80;
         SetTextColor(hdc, rgb(if warn { WARN_HI } else { TEXT_PRIMARY }));
         gdi_text(hdc, &fmt_pct(util),
                  bx + bar_w + 4, y, pct_w, row_h,
                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
-        // ETA: 44px, #8B949E
+        // ETA / reset countdown
         SetTextColor(hdc, rgb(TEXT_DIM));
         gdi_text(hdc, &fmt_countdown(secs),
                  bx + bar_w + 4 + pct_w + 2, y, eta_w, row_h,
@@ -291,14 +371,12 @@ unsafe fn draw_float_section(
 
 // (draw_section removed — replaced by draw_float_section above)
 
-// ─── AppBar dock mode (300×40, embedded in taskbar) ──────────────────────────
+// ─── AppBar dock mode (embedded in taskbar) ───────────────────────────────────
 //
-// Design spec (components.jsx AppBarDock / DockSide / DockRow):
-//   Total size: 300×40, background #161B22 (bgTitle)
-//   Each side: padding 0 8px; badge = diamond(9px) + letter mono 10px/700; gap 7px
-//   Two stacked rows, gap 3px, vertically centred
-//   Row: label 12px · bar flex · pct 26px right-align · eta 30px
-//   Bar: 5px height · radius 2.5
+// Layout: up to 3 equal-width columns (Claude | Codex | Cursor).
+// Column width = total_width / n_visible_columns.
+// Each column: accent stripe (4px) | label | 2 stacked bars | pct | eta.
+// Cursor column uses pure-black accent stripe (CURSOR_STRIPE).
 unsafe fn paint_appbar(hwnd: HWND, state: &AppState) {
     let mut ps = PAINTSTRUCT::default();
     let hdc = BeginPaint(hwnd, &mut ps);
@@ -309,68 +387,76 @@ unsafe fn paint_appbar(hwnd: HWND, state: &AppState) {
     let n = APPBAR_PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     if n % 120 == 1 {
         info!(
-            "[paint_appbar] count={} hwnd={:?} size={}x{} show_claude={} show_codex={} c5h={:?} x5h={:?}",
-            n,
-            hwnd,
-            w,
-            h,
-            state.settings.show_claude,
-            state.settings.show_codex,
-            state.claude.utilization_5h,
-            state.codex.utilization_5h
+            "[paint_appbar] count={} hwnd={:?} size={}x{} claude={} codex={} cursor={} c5h={:?} x5h={:?} cr={:?}",
+            n, hwnd, w, h,
+            state.settings.show_claude, state.settings.show_codex, state.settings.show_cursor,
+            state.claude.utilization_5h, state.codex.utilization_5h,
+            state.cursor.auto_usage_pct,
         );
     }
 
-    // Scale all appbar typography/layout from the design base (300x40).
-    // This keeps proportions stable when taskbar height is not 40 px.
     let scale = (h.max(1) as f32) / 40.0;
-    let px_row = (9.5 * scale).round().clamp(8.0, 18.0) as i32;
+    let px_row   = (9.5  * scale).round().clamp(8.0, 18.0) as i32;
     let px_badge = (10.0 * scale).round().clamp(8.0, 19.0) as i32;
-    let fh_row = -px_row;
+    let fh_row   = -px_row;
     let fh_badge = -px_badge;
 
     let fn_mono = wstr("JetBrains Mono");
 
-    // Double-buffered paint to avoid visible redraw jitter in taskbar embedding.
-    let mem_dc = CreateCompatibleDC(hdc);
+    let mem_dc  = CreateCompatibleDC(hdc);
     let mem_bmp = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
     let old_bmp = SelectObject(mem_dc, mem_bmp);
     SetBkMode(mem_dc, TRANSPARENT);
 
-    // Deterministic clear: sample taskbar color and paint full rect each frame.
-    // This avoids stale-text ghosting caused by parent-background self-copy.
     let clear = sample_taskbar_color(hwnd).unwrap_or(BG);
     gdi_fill(mem_dc, 0, 0, w, h, clear);
 
     let show_claude = state.settings.show_claude;
     let show_codex  = state.settings.show_codex;
-    let both = show_claude && show_codex;
-    let side_w = if both { w / 2 } else { w };
+    let show_cursor = state.settings.show_cursor;
+
+    // Count enabled columns to compute equal column width.
+    let n_cols = (show_claude as i32) + (show_codex as i32) + (show_cursor as i32);
+    let col_w = if n_cols > 0 { w / n_cols } else { w };
+
     let mut x_off = 0i32;
 
     if show_claude {
         draw_dock_side(
             mem_dc, &fn_mono, fh_badge, fh_row,
-            x_off, 0, side_w, h,
-            "C", CLAUDE_HI, CLAUDE_MID, CLAUDE_LO,
-            state.claude.utilization_5h, secs_until(state.claude.reset_5h),
-            state.claude.utilization_7d, secs_until(state.claude.reset_7d),
+            x_off, 0, col_w, h,
+            "C", CLAUDE_HI, CLAUDE_MID, CLAUDE_LO, CLAUDE_HI,
+            "5h", state.claude.utilization_5h, secs_until(state.claude.reset_5h),
+            "7d", state.claude.utilization_7d, secs_until(state.claude.reset_7d),
         );
-        x_off += side_w;
-    }
-
-    if both {
-        // 1px solid #2D3142 center divider, full height
-        gdi_vline(mem_dc, x_off, 0, h, DIVIDER);
+        x_off += col_w;
+        if show_codex || show_cursor {
+            gdi_vline(mem_dc, x_off, 0, h, DIVIDER);
+        }
     }
 
     if show_codex {
         draw_dock_side(
             mem_dc, &fn_mono, fh_badge, fh_row,
-            x_off, 0, side_w, h,
-            "X", CODEX_HI, CODEX_MID, CODEX_LO,
-            state.codex.utilization_5h, secs_until(state.codex.reset_5h),
-            state.codex.utilization_7d, secs_until(state.codex.reset_7d),
+            x_off, 0, col_w, h,
+            "X", CODEX_HI, CODEX_MID, CODEX_LO, CODEX_HI,
+            "5h", state.codex.utilization_5h, secs_until(state.codex.reset_5h),
+            "7d", state.codex.utilization_7d, secs_until(state.codex.reset_7d),
+        );
+        x_off += col_w;
+        if show_cursor {
+            gdi_vline(mem_dc, x_off, 0, h, DIVIDER);
+        }
+    }
+
+    if show_cursor {
+        let reset_secs = secs_until(state.cursor.reset_date);
+        draw_dock_side(
+            mem_dc, &fn_mono, fh_badge, fh_row,
+            x_off, 0, col_w, h,
+            "CR", CURSOR_HI, CURSOR_MID, CURSOR_LO, CURSOR_STRIPE,
+            "AUTO", state.cursor.auto_usage_pct, reset_secs,
+            "API",  state.cursor.api_usage_pct,  reset_secs,
         );
     }
 
@@ -412,75 +498,68 @@ unsafe fn sample_taskbar_color(hwnd: HWND) -> Option<u32> {
     Some((r << 16) | (g << 8) | b)
 }
 
-/// Draw one side of the AppBar dock (Claude or Codex).
-/// Spec: padding 0 8px; badge (diamond 9px + letter mono 10pt/700); gap 7px to rows.
-/// Rows: label 12px | bar flex | pct 26px right | eta 30px; bar 5px, r=2; gap 3px.
+/// Draw one column of the AppBar dock.
+/// stripe_color: left accent stripe color (brand hi for Claude/Codex, light-grey for Cursor).
+/// label1/label2: row labels (e.g. "5h"/"7d" or "AUTO"/"API").
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_dock_side(
     hdc: HDC,
     fn_mono: &[u16],
     _fh_badge: i32, fh_row: i32,
-    x: i32, _y: i32, side_w: i32, h: i32,
+    x: i32, _y: i32, col_w: i32, h: i32,
     _letter: &str,
-    hi: u32, mid: u32, lo: u32,
-    u5h: Option<f32>, s5h: i64,
-    u7d: Option<f32>, s7d: i64,
+    hi: u32, mid: u32, lo: u32, stripe_color: u32,
+    label1: &str, u1: Option<f32>, s1: i64,
+    label2: &str, u2: Option<f32>, s2: i64,
 ) {
     let scale = (h.max(1) as f32) / 40.0;
     let sc = |v: i32| ((v as f32) * scale).round().max(1.0) as i32;
 
-    let pad      = sc(2);   // 左边界 padding 减小（原 4）
-    let stripe_w = sc(4);
+    let pad        = sc(2);
+    let stripe_w   = sc(4);
     let stripe_gap = sc(4);
-    let label_w  = sc(10).clamp(9, 14);
-    let pct_w    = sc(26).clamp(24, 34);
-    let eta_w    = sc(32).clamp(30, 42);  // keep room but avoid squeezing progress bar
-    let bar_h    = sc(5).max(3);
-    let row_gap  = sc(6);
+    // "AUTO" is 4 ASCII chars at ~7px each = ~28px; clamp to [26,36].
+    let label_w    = sc(16).clamp(26, 36);
+    let pct_w      = sc(26).clamp(24, 34);
+    let eta_w      = sc(30).clamp(28, 40);
+    let bar_h      = sc(5).max(3);
+    let row_gap    = sc(6);
 
-    // Left accent stripe (full appbar height, flush to side boundary).
-    gdi_fill(hdc, x, 0, stripe_w, h, hi);
+    // Accent stripe — pure black for Cursor, brand colour for others
+    gdi_fill(hdc, x, 0, stripe_w, h, stripe_color);
 
     let rows_area_x = x + pad + stripe_w + stripe_gap;
-    let bar_w = (side_w - (rows_area_x - x) - pad - label_w - 5 - pct_w - 2 - eta_w).max(20);
+    let bar_w = (col_w - (rows_area_x - x) - pad - label_w - 5 - pct_w - 2 - eta_w).max(16);
 
-    // Vertical centering: two bars + gap
     let total_h = bar_h * 2 + row_gap;
     let y_top   = (h - total_h) / 2;
+    let bx      = rows_area_x + label_w + 5;
 
-    let bx = rows_area_x + label_w + 5;  // bar start x（间距从 2 增加到 5）
-
-    // Row helper closure — draw label, track, fill, pct, eta at y_row
     for (row_y, label, util, secs) in [
-        (y_top,              "5h", u5h, s5h),
-        (y_top + bar_h + row_gap, "7d", u7d, s7d),
+        (y_top,                  label1, u1, s1),
+        (y_top + bar_h + row_gap, label2, u2, s2),
     ] {
-        let hfm = make_font_weight(fn_mono, fh_row, 600);
+        let hfm  = make_font_weight(fn_mono, fh_row, 600);
         let old2 = SelectObject(hdc, hfm);
 
-        // Label
         SetTextColor(hdc, rgb(TEXT_TITLE));
         gdi_text(hdc, label,
                  rows_area_x, row_y - 2, label_w, bar_h + 4,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        // Track
         gdi_rrect(hdc, bx, row_y, bar_w, bar_h, 2, BAR_TRACK);
-        // Fill
         let fw = util.map(|u| ((u * bar_w as f32) as i32).max(0).min(bar_w)).unwrap_or(0);
         if fw > 0 {
             let (bhi, bmid, blo) = bar_colors(util, hi, mid, lo);
             gdi_grad_bar(hdc, bx, row_y, fw, bar_h, blo, bmid, bhi);
         }
 
-        // Pct: 26px right-align, warn ≥80%
         let warn = util.unwrap_or(0.0) >= 0.80;
         SetTextColor(hdc, rgb(if warn { WARN_HI } else { TEXT_PRIMARY }));
         gdi_text(hdc, &fmt_pct(util),
                  bx + bar_w + 2, row_y - 2, pct_w, bar_h + 4,
                  DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
-        // ETA: 30px, #8B949E
         SetTextColor(hdc, rgb(TEXT_DIM));
         gdi_text(hdc, &fmt_countdown(secs),
                  bx + bar_w + 2 + pct_w + 2, row_y - 2, eta_w, bar_h + 4,
