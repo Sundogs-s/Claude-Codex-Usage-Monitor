@@ -60,15 +60,29 @@ pub fn spawn(state: SharedState, hwnd: HWND) {
 
 // ─── Pollers ─────────────────────────────────────────────────────────────────
 
+/// The Claude usage endpoint rate-limits aggressively: never poll it faster than this.
+/// Measured 2026-09-03 (Max 5x): a request 60 s after a success got 429, 120 s got 200.
+const CLAUDE_MIN_INTERVAL: u64 = 120;
+/// First back-off step after a 429, and the cap for doubling.
+const CLAUDE_BACKOFF_START: u64 = 240;
+const CLAUDE_BACKOFF_MAX:   u64 = 900;
+
 async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
+    let mut backoff: u64 = 0;
     loop {
         info!("[monitor] polling Claude…");
         let mut changed = false;
         match claude::fetch(&client).await {
             Ok(usage) => {
+                backoff = 0;
                 let mut s = state.lock();
                 if s.claude != usage {
                     s.claude = usage;
+                    changed = true;
+                }
+                if s.claude_stale || s.claude_next_retry.is_some() {
+                    s.claude_stale = false;
+                    s.claude_next_retry = None;
                     changed = true;
                 }
                 if !s.claude_error.is_empty() {
@@ -76,9 +90,35 @@ async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
                     changed = true;
                 }
             }
+            Err(claude::FetchError::RateLimited) => {
+                backoff = if backoff == 0 {
+                    CLAUDE_BACKOFF_START.max(CLAUDE_INTERVAL.load(Ordering::Relaxed))
+                } else {
+                    (backoff * 2).min(CLAUDE_BACKOFF_MAX)
+                };
+                let retry_at = chrono::Utc::now() + chrono::Duration::seconds(backoff as i64);
+                info!("[monitor] Claude usage API rate-limited — keeping last data, retry in {}s", backoff);
+                let mut s = state.lock();
+                if s.claude.rows.is_empty() {
+                    s.claude_error = "Claude: usage API rate-limited".to_string();
+                } else {
+                    s.claude_stale = true;
+                    s.claude_error = String::new();
+                }
+                s.claude_next_retry = Some(retry_at);
+                changed = true;
+            }
             Err(e) => {
+                backoff = 0;
                 error!("[monitor] Claude: {}", e);
                 let mut s = state.lock();
+                if matches!(e, claude::FetchError::Auth(_)) && !s.claude.rows.is_empty() {
+                    // Credentials are gone: the old numbers are meaningless, blank them.
+                    s.claude.rows.clear();
+                    changed = true;
+                }
+                s.claude_stale = false;
+                s.claude_next_retry = None;
                 let next_err = format!("Claude: {}", e);
                 if s.claude_error != next_err {
                     s.claude_error = next_err;
@@ -89,7 +129,11 @@ async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
         if changed {
             notify_repaint(hwnd);
         }
-        let secs = CLAUDE_INTERVAL.load(Ordering::Relaxed);
+        let secs = if backoff > 0 {
+            backoff
+        } else {
+            CLAUDE_INTERVAL.load(Ordering::Relaxed).max(CLAUDE_MIN_INTERVAL)
+        };
         tokio::select! {
             _ = sleep(Duration::from_secs(secs)) => {}
             _ = WAKE_POLLERS.notified() => {}

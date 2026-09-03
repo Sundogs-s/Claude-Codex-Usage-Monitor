@@ -9,3 +9,4 @@ extracted_zip/
 _runtime_logs/
 *.zip
 _Documentation/
+*-Setup.exe

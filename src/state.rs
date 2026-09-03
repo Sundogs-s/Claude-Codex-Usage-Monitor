@@ -15,6 +15,46 @@ pub struct WindowUsage {
     pub reset_7d:       Option<DateTime<Utc>>,
 }
 
+/// One rate-limit window row (e.g. "5h", "7d", "Fable").
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRow {
+    pub label:       String,
+    /// 0.0–1.0
+    pub utilization: Option<f32>,
+    pub reset:       Option<DateTime<Utc>>,
+}
+
+/// Claude plan usage: a dynamic list of windows (5h, 7d, per-model weekly, extra usage).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClaudeUsage {
+    pub rows:       Vec<UsageRow>,
+    /// When `rows` was last fetched successfully (None = never).
+    pub fetched_at: Option<DateTime<Utc>>,
+    /// Plan label for the heading meta text, e.g. "Max 5x".
+    pub tier:       Option<String>,
+}
+
+impl ClaudeUsage {
+    pub fn util(&self, label: &str) -> Option<f32> {
+        self.rows.iter().find(|r| r.label == label).and_then(|r| r.utilization)
+    }
+    /// Seconds since the last successful fetch (None = never fetched).
+    pub fn age_secs(&self) -> Option<i64> {
+        self.fetched_at.map(|t| (Utc::now() - t).num_seconds().max(0))
+    }
+}
+
+/// Human-readable age: "now", "3m ago", "2h ago".
+pub fn fmt_age(secs: Option<i64>) -> String {
+    match secs {
+        None => "–".to_string(),
+        Some(s) if s < 60 => "now".to_string(),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
+        Some(s) if s < 86400 => format!("{}h ago", s / 3600),
+        Some(s) => format!("{}d ago", s / 86400),
+    }
+}
+
 /// Cursor personal-plan usage snapshot.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CursorUsage {
@@ -121,23 +161,55 @@ impl Default for Settings {
 // Minimum height: 132 px (single section, matches MIN_H in main.rs)
 
 pub const SECTION_H:    i32 = 80;
+/// Extra height per data row beyond the 2-row baseline (row 22px + gap 5px).
+pub const ROW_PITCH:    i32 = 27;
 pub const HEADER_H:     i32 = 28;
 pub const DIVIDER_GAP:  i32 = 8;
 pub const BOTTOM_PAD:   i32 = 12;
+/// Bottom banner (stale / error line) height when shown.
+pub const BANNER_H:     i32 = 16;
+
+/// Height of a section holding `rows` data rows (2 rows = SECTION_H).
+pub fn section_height(rows: usize) -> i32 {
+    SECTION_H + (rows.max(2) as i32 - 2) * ROW_PITCH
+}
+
+/// Layout inputs derived from live state (not settings).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LayoutInfo {
+    /// Number of rows in the Claude section (>= 2).
+    pub claude_rows: usize,
+    /// Whether a bottom banner (stale / error text) is shown.
+    pub banner:      bool,
+}
+
+/// AppBar column widths for the visible sections (Claude is wider to fit 3 rows).
+pub const APPBAR_COL_W:        i32 = 180;
+pub const APPBAR_CLAUDE_COL_W: i32 = 200;
+
+pub fn appbar_col_widths(settings: &Settings) -> Vec<i32> {
+    let mut v = Vec::new();
+    if settings.show_claude { v.push(APPBAR_CLAUDE_COL_W); }
+    if settings.show_codex  { v.push(APPBAR_COL_W); }
+    if settings.show_cursor { v.push(APPBAR_COL_W); }
+    v
+}
 
 /// Compute the preferred floating-window height for the currently enabled sections.
 /// Returns at least 132 (MIN_H) so the window is never empty.
-pub fn calc_window_height(settings: &Settings) -> i32 {
-    let n = [settings.show_claude, settings.show_codex, settings.show_cursor]
-        .iter()
-        .filter(|&&v| v)
-        .count() as i32;
+pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
+    let mut heights: Vec<i32> = Vec::new();
+    if settings.show_claude { heights.push(section_height(layout.claude_rows)); }
+    if settings.show_codex  { heights.push(SECTION_H); }
+    if settings.show_cursor { heights.push(SECTION_H); }
 
+    let n = heights.len() as i32;
     if n == 0 {
         return 132;
     }
 
-    let h = HEADER_H + n * SECTION_H + (n - 1) * DIVIDER_GAP + BOTTOM_PAD;
+    let banner = if layout.banner { BANNER_H } else { 0 };
+    let h = HEADER_H + heights.iter().sum::<i32>() + (n - 1) * DIVIDER_GAP + banner + BOTTOM_PAD;
     h.max(132)
 }
 
@@ -155,15 +227,31 @@ pub struct MonitorInfo {
 
 #[derive(Debug, Default)]
 pub struct AppState {
-    pub claude:        WindowUsage,
+    pub claude:        ClaudeUsage,
     pub codex:         WindowUsage,
     pub cursor:        CursorUsage,
+    /// Claude rows are the last-known values; the usage API is currently rate-limited.
+    pub claude_stale:  bool,
+    /// Next Claude retry time while backing off (shown in the stale banner).
+    pub claude_next_retry: Option<DateTime<Utc>>,
     pub claude_error:  String,
     pub codex_error:   String,
     pub cursor_error:  String,
     pub floating_hover_hidden: bool,
     pub settings:      Settings,
     pub monitors:      Vec<MonitorInfo>,
+}
+
+impl AppState {
+    /// Layout inputs for the floating window derived from the live data.
+    pub fn layout(&self) -> LayoutInfo {
+        let claude_rows = self.claude.rows.len().max(2);
+        let claude_banner = self.settings.show_claude
+            && (self.claude_stale || !self.claude_error.is_empty());
+        let other_banner = (self.settings.show_codex && !self.codex_error.is_empty())
+            || (self.settings.show_cursor && !self.cursor_error.is_empty());
+        LayoutInfo { claude_rows, banner: claude_banner || other_banner }
+    }
 }
 
 pub type SharedState = Arc<Mutex<AppState>>;

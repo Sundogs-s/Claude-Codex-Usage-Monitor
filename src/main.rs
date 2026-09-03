@@ -20,12 +20,12 @@ mod state;
 
 use log::{info, LevelFilter};
 use monitor::set_refresh_secs;
-use simplelog::{CombinedLogger, Config, SharedLogger, WriteLogger};
+use simplelog::{CombinedLogger, Config, SharedLogger};
 #[cfg(debug_assertions)]
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 use state::{
-    calc_window_height, load_settings, new_shared, save_settings,
-    DisplayMode, MonitorInfo, RefreshRate, Settings, SharedState,
+    appbar_col_widths, calc_window_height, load_settings, new_shared, save_settings,
+    DisplayMode, LayoutInfo, MonitorInfo, RefreshRate, Settings, SharedState, APPBAR_COL_W,
 };
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -61,16 +61,29 @@ use windows::{
 const DEF_W: i32      = 320;
 const MIN_W: i32      = 240;
 const MIN_H: i32      = 132;   // single-section minimum
-// AppBar: each visible column is 180px wide; total width scales with n_visible_cols.
-const APPBAR_COL_W: i32 = 180;
-
-/// Compute the AppBar width from current settings (number of visible columns × 180px).
-fn appbar_width(settings: &Settings) -> i32 {
-    let n = (settings.show_claude as i32)
-          + (settings.show_codex  as i32)
-          + (settings.show_cursor as i32);
-    n.max(1) * APPBAR_COL_W
+/// System DPI scale (1.0 at 96 dpi). The taskbar band height and the dock fonts scale
+/// with DPI, so the column widths must too or the labels get clipped.
+fn system_scale() -> f32 {
+    unsafe {
+        use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSX};
+        let hdc = GetDC(None);
+        if hdc.0.is_null() { return 1.0; }
+        let dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+        let _ = ReleaseDC(None, hdc);
+        if dpi <= 0 { 1.0 } else { (dpi as f32 / 96.0).clamp(1.0, 4.0) }
+    }
 }
+
+/// Compute the AppBar width from current settings (sum of visible column widths at 96 dpi:
+/// Claude 200px to fit its three rows, others 180px), scaled by the system DPI.
+fn appbar_width(settings: &Settings) -> i32 {
+    let base = appbar_col_widths(settings).iter().sum::<i32>().max(APPBAR_COL_W);
+    (base as f32 * system_scale()).round() as i32
+}
+
+/// Layout key of the last WM_APP repaint (claude rows << 1 | banner) — the floating
+/// window is resized only when this changes, never on every data refresh.
+static LAST_LAYOUT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
 const TIMER_ID: usize = 1;
 const HOVER_TIMER_ID: usize = 2;
 const TRAY_UID: u32   = 1;
@@ -96,28 +109,122 @@ const IDM_EXIT:           u32 = 400;
 const IDM_MONITOR_BASE:   u32 = 500; // +index per monitor
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
+//
+// Size-rotated file logger: usage-monitor.log is capped at LOG_MAX_BYTES; when it
+// overflows it becomes usage-monitor.1.log (one generation kept). An oversized file
+// found at startup (the pre-0.4 log grew to several GB) is discarded instead of kept.
+// File level is Info; set USAGE_MONITOR_DEBUG=1 for Debug (per-request dumps).
+const LOG_MAX_BYTES:     u64 = 5 * 1024 * 1024;
+const LOG_DISCARD_BYTES: u64 = 100 * 1024 * 1024;
+
+struct RotatingFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl RotatingFile {
+    fn open(path: PathBuf) -> Self {
+        let mut rf = RotatingFile { path, file: None, size: 0 };
+        rf.size = std::fs::metadata(&rf.path).map(|m| m.len()).unwrap_or(0);
+        if rf.size > LOG_MAX_BYTES {
+            rf.rotate();
+        } else {
+            rf.reopen();
+        }
+        rf
+    }
+
+    fn backup_path(&self) -> PathBuf {
+        self.path.with_file_name("usage-monitor.1.log")
+    }
+
+    fn reopen(&mut self) {
+        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+    }
+
+    fn rotate(&mut self) {
+        self.file = None;
+        let bak = self.backup_path();
+        let _ = std::fs::remove_file(&bak);
+        if self.size > LOG_DISCARD_BYTES {
+            let _ = std::fs::remove_file(&self.path);
+        } else {
+            let _ = std::fs::rename(&self.path, &bak);
+        }
+        self.size = 0;
+        self.reopen();
+    }
+
+    fn write_line(&mut self, line: &str) {
+        if self.size > LOG_MAX_BYTES {
+            self.rotate();
+        }
+        if let Some(f) = self.file.as_mut() {
+            use std::io::Write;
+            if f.write_all(line.as_bytes()).is_ok() {
+                self.size += line.len() as u64;
+            }
+        }
+    }
+}
+
+struct RotatingFileLogger {
+    level: LevelFilter,
+    inner: parking_lot::Mutex<RotatingFile>,
+}
+
+impl log::Log for RotatingFileLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= self.level
+    }
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) { return; }
+        let line = if r.level() >= log::Level::Debug {
+            format!("{} [{}] {}: {}\n", chrono::Local::now().format("%H:%M:%S"), r.level(), r.target(), r.args())
+        } else {
+            format!("{} [{}] {}\n", chrono::Local::now().format("%H:%M:%S"), r.level(), r.args())
+        };
+        self.inner.lock().write_line(&line);
+    }
+    fn flush(&self) {}
+}
+
+impl SharedLogger for RotatingFileLogger {
+    fn level(&self) -> LevelFilter { self.level }
+    fn config(&self) -> Option<&Config> { None }
+    fn as_log(self: Box<Self>) -> Box<dyn log::Log> { self }
+}
+
 fn init_logger() {
-    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let log_dir = workspace.join("_runtime_logs");
+    let log_base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let log_dir = log_base.join("UsageMonitor").join("_runtime_logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("usage-monitor.log");
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .expect("log file");
-
-    let loggers: Vec<Box<dyn SharedLogger>> = vec![
-        WriteLogger::new(LevelFilter::Debug, Config::default(), file),
-    ];
+    let file_level = if std::env::var("USAGE_MONITOR_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Info
+    };
+    let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
+    loggers.push(Box::new(RotatingFileLogger {
+        level: file_level,
+        inner: parking_lot::Mutex::new(RotatingFile::open(log_path.clone())),
+    }));
     #[cfg(debug_assertions)]
-    loggers.push(TermLogger::new(
-        LevelFilter::Debug,
-        Config::default(),
-        TerminalMode::Mixed,
-        ColorChoice::Auto,
-    ));
-    CombinedLogger::init(loggers).ok();
+    {
+        loggers.push(TermLogger::new(
+            LevelFilter::Debug,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ));
+    }
+    if !loggers.is_empty() {
+        CombinedLogger::init(loggers).ok();
+    }
     info!(
         "usage-monitor v{} starting — log: {}",
         env!("CARGO_PKG_VERSION"),
@@ -167,7 +274,7 @@ fn update_tray_icon(hwnd: HWND, state: &SharedState) {
     let (c5h, x5h, c_err, x_err, cr_err, cr_pct) = {
         let s = state.lock();
         (
-            s.claude.utilization_5h,
+            s.claude.util("5h"),
             s.codex.utilization_5h,
             s.claude_error.clone(),
             s.codex_error.clone(),
@@ -421,6 +528,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
     let s = state.lock();
     let monitors = s.monitors.clone();
     let settings = s.settings.clone();
+    let layout = s.layout();
     drop(s);
 
     let mon_idx = settings.monitor_idx.min(monitors.len().saturating_sub(1));
@@ -432,7 +540,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
     match settings.display_mode {
         DisplayMode::Floating => {
             let fw = settings.win_w.max(MIN_W);
-            let fh = if settings.win_h < MIN_H { calc_window_height(&settings) } else { settings.win_h };
+            let fh = if settings.win_h < MIN_H { calc_window_height(&settings, layout) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
             unsafe {
@@ -455,7 +563,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
         DisplayMode::CompactBar => {
             // CompactBar mode removed: treat as Floating for backward-compatible settings.
             let fw = settings.win_w.max(MIN_W);
-            let fh = if settings.win_h < MIN_H { calc_window_height(&settings) } else { settings.win_h };
+            let fh = if settings.win_h < MIN_H { calc_window_height(&settings, layout) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
             unsafe {
@@ -797,9 +905,9 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
 /// Resize the floating window to the computed height for the currently-enabled
 /// sections. Does nothing in AppBar mode (size is fixed by the taskbar band).
 fn resize_to_content(hwnd: HWND, state: &SharedState) {
-    let (mode, settings) = {
+    let (mode, settings, layout) = {
         let s = state.lock();
-        (s.settings.display_mode, s.settings.clone())
+        (s.settings.display_mode, s.settings.clone(), s.layout())
     };
     // AppBar: re-register with the new (possibly narrower/wider) width.
     if mode == DisplayMode::AppBar {
@@ -808,7 +916,7 @@ fn resize_to_content(hwnd: HWND, state: &SharedState) {
     }
     if mode != DisplayMode::Floating { return; }
 
-    let new_h = calc_window_height(&settings);
+    let new_h = calc_window_height(&settings, layout);
     unsafe {
         let mut wr = RECT::default();
         GetWindowRect(hwnd, &mut wr).ok();
@@ -918,6 +1026,21 @@ fn do_refresh(hwnd: HWND, state: &SharedState, rate: RefreshRate) {
 fn main() -> Result<()> {
     init_logger();
 
+    // Diagnostic mode: `usage-monitor --probe [--cli]` runs one Claude fetch, prints the
+    // outcome to stdout and the log, and exits without creating any window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--probe") {
+        let force_cli = args.iter().any(|a| a == "--cli");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .expect("tokio runtime");
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()
+            .expect("HTTP client");
+        let out = rt.block_on(claude::probe(&client, force_cli));
+        info!("[probe] {}", out);
+        println!("{}", out);
+        return Ok(());
+    }
+
     unsafe {
         let hinstance: HINSTANCE = std::mem::transmute(GetModuleHandleW(None)?);
         let class_name = w!("UsageMonitorOverlay");
@@ -959,9 +1082,10 @@ fn main() -> Result<()> {
         let (wx, wy, ww, wh) = match settings.display_mode {
             DisplayMode::Floating => {
                 let fw = settings.win_w.max(MIN_W);
-                // Use calc_window_height when win_h is -1 (auto) or from settings
+                // Use calc_window_height when win_h is -1 (auto) or from settings.
+                // No data yet at startup → 2 Claude rows; WM_APP resizes once rows arrive.
                 let fh = if settings.win_h < MIN_H {
-                    calc_window_height(&settings)
+                    calc_window_height(&settings, LayoutInfo { claude_rows: 2, banner: false })
                 } else {
                     settings.win_h
                 };
@@ -972,7 +1096,7 @@ fn main() -> Result<()> {
             DisplayMode::CompactBar => {
                 let fw = settings.win_w.max(MIN_W);
                 let fh = if settings.win_h < MIN_H {
-                    calc_window_height(&settings)
+                    calc_window_height(&settings, LayoutInfo { claude_rows: 2, banner: false })
                 } else {
                     settings.win_h
                 };
@@ -1126,6 +1250,16 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
             WM_APP => {
                 if let Some(sh) = get_state() {
                     update_tray_icon(hwnd, sh);
+                    // Grow/shrink the floating window when the Claude row count or the
+                    // banner line changes (e.g. the Fable row arriving after first fetch).
+                    let key = {
+                        let s = sh.lock();
+                        let l = s.layout();
+                        ((l.claude_rows as u32) << 1) | (l.banner as u32)
+                    };
+                    if LAST_LAYOUT_KEY.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+                        resize_to_content(hwnd, sh);
+                    }
                 }
                 InvalidateRect(hwnd, None, false).ok();
                 LRESULT(0)
