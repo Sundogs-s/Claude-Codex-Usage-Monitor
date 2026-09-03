@@ -50,12 +50,17 @@ VIAddVersionKey /LANG=0 "FileDescription"  "${APP_NAME} Installer"
 Section "MainSection" SecMain
     SectionIn RO
 
-    ; Kill any running instance
+    ; Kill any running instance. FindWindow cannot see the AppBar window (it is a child
+    ; of the taskbar), so terminate by image name; the installer runs elevated already.
     FindWindow $0 "" "${APP_NAME}"
     IntCmp $0 0 +2
         SendMessage $0 ${WM_CLOSE} 0 0
+    nsExec::ExecToLog 'taskkill /F /IM ${APP_EXE}'
+    Pop $0
+    Sleep 800
 
     SetOutPath "$INSTDIR"
+    SetOverwrite on
     File "target\release\${APP_EXE}"
 
     ; Uninstall registry entries
@@ -93,10 +98,12 @@ SectionEnd
 ; ----------------------------------------------------------------------------
 Section "Uninstall"
 
-    ; Kill running instance
+    ; Kill running instance (by image name; the AppBar window is not top-level)
     FindWindow $0 "" "${APP_NAME}"
     IntCmp $0 0 +2
         SendMessage $0 ${WM_CLOSE} 0 0
+    nsExec::ExecToLog 'taskkill /F /IM ${APP_EXE}'
+    Pop $0
     Sleep 800
 
     ; Remove autostart if present
