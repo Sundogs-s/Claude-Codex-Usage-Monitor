@@ -60,7 +60,7 @@ use windows::{
 // ─── Constants ────────────────────────────────────────────────────────────────
 const DEF_W: i32      = 320;
 const MIN_W: i32      = 240;
-const MIN_H: i32      = 132;   // single-section minimum
+const MIN_H: i32      = 96;    // single-section minimum (Neon: 24 + 80 + 8 = 112; Classic: 120)
 /// System DPI scale (1.0 at 96 dpi). The taskbar band height and the dock fonts scale
 /// with DPI, so the column widths must too or the labels get clipped.
 fn system_scale() -> f32 {

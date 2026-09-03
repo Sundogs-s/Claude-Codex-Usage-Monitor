@@ -182,7 +182,7 @@ impl Default for Settings {
 //   divider gap:        8 px  (between sections; N-1 dividers for N sections)
 //   bottom padding:    12 px
 //
-// Minimum height: 132 px (single section, matches MIN_H in main.rs)
+// Minimum height: 96 px (matches MIN_H in main.rs; a single Neon section is 112, Classic 120)
 
 pub const SECTION_H:    i32 = 80;
 /// Extra height per data row beyond the 2-row baseline (row 22px + gap 5px).
@@ -242,7 +242,7 @@ pub fn appbar_col_widths(settings: &Settings) -> Vec<i32> {
 }
 
 /// Compute the preferred floating-window height for the currently enabled sections.
-/// Returns at least 132 (MIN_H) so the window is never empty.
+/// Returns at least 96 (MIN_H) so the window is never empty.
 pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
     let neon = settings.theme == Theme::Neon;
     let sec_h = |rows: usize| if neon { neon_section_height(rows) } else { section_height(rows) };
@@ -254,7 +254,7 @@ pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
 
     let n = heights.len() as i32;
     if n == 0 {
-        return 132;
+        return 96;
     }
 
     let (header, gap, banner_h, foot) = if neon {
@@ -264,7 +264,7 @@ pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
     };
     let banner = if layout.banner { banner_h } else { 0 };
     let h = header + heights.iter().sum::<i32>() + (n - 1) * gap + banner + foot;
-    h.max(132)
+    h.max(96)
 }
 
 // ─── Monitor info ─────────────────────────────────────────────────────────────

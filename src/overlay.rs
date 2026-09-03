@@ -1272,13 +1272,13 @@ unsafe fn paint_floating_neon(hwnd: HWND, state: &AppState) {
 
     // Status chip (hex glyph + LIVE / STALE / ERR), right-aligned at the 16px pad.
     let (chip, chip_col) = neon_status(state);
+    // No character extra here: DrawText right-aligns without it but paints with it,
+    // which clipped the last glyph ("LIVI").
     let hfc = make_font_weight(&fn_mono, -9, 600);
     let old = SelectObject(hdc, hfc);
-    SetTextCharacterExtra(hdc, 1);
-    let chip_w = 36;
+    let chip_w = 40;
     glow_text(hdc, chip, w - 16 - chip_w, 0, chip_w, hh - 1,
               DT_RIGHT | DT_SINGLELINE | DT_VCENTER, chip_col, BG);
-    SetTextCharacterExtra(hdc, 0);
     SelectObject(hdc, old);
     DeleteObject(hfc);
     draw_hex(hdc, w - 16 - chip_w - 10, (hh - 1) / 2, 5, chip_col, BG);
