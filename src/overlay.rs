@@ -40,7 +40,8 @@ use windows::{
         Graphics::Gdi::{
             BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
             CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
-            EndPaint, FillRect, GetDeviceCaps, GetPixel, GetWindowDC, HFONT, LineTo, MoveToEx,
+            EndPaint, FillRect, GetDC, GetDeviceCaps, GetPixel, GetTextFaceW, GetWindowDC, HFONT,
+            LineTo, MoveToEx, ReleaseDC as GdiReleaseDC,
             Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetPolyFillMode,
             SetTextCharacterExtra, SetTextColor, SetWindowRgn, ALTERNATE, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT,
             DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, HDC, LOGPIXELSX, PAINTSTRUCT, PS_NULL,
@@ -95,6 +96,52 @@ fn blend(a: u32, b: u32, t: f32) -> u32 {
 
 fn wstr(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// ─── Font resolution ─────────────────────────────────────────────────────────
+//
+// GDI silently substitutes a missing face (JetBrains Mono → Courier New), which
+// wrecks the layout. Resolve each role once against the installed fonts.
+static MONO_FACE:    std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+static DISPLAY_FACE: std::sync::OnceLock<Vec<u16>> = std::sync::OnceLock::new();
+
+const MONO_CANDIDATES:    &[&str] = &["JetBrains Mono", "Cascadia Mono", "Consolas"];
+const DISPLAY_CANDIDATES: &[&str] = &["Bahnschrift", "Segoe UI Semibold", "Segoe UI"];
+
+/// First candidate face the font mapper actually honours (checked via GetTextFaceW).
+fn resolve_face(candidates: &[&str]) -> Vec<u16> {
+    unsafe {
+        let hdc = GetDC(None);
+        let mut chosen: Option<&str> = None;
+        if !hdc.0.is_null() {
+            for c in candidates {
+                let name = wstr(c);
+                let f = CreateFontW(-12, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, PCWSTR(name.as_ptr()));
+                let old = SelectObject(hdc, f);
+                let mut buf = [0u16; 64];
+                let n = GetTextFaceW(hdc, Some(&mut buf)).max(0) as usize;
+                let got = String::from_utf16_lossy(&buf[..n.min(64)]);
+                SelectObject(hdc, old);
+                DeleteObject(f);
+                if got.trim_end_matches('\0').eq_ignore_ascii_case(c) {
+                    chosen = Some(c);
+                    break;
+                }
+            }
+            let _ = GdiReleaseDC(None, hdc);
+        }
+        let face = chosen.unwrap_or(candidates[candidates.len() - 1]);
+        info!("[font] {:?} → {}", candidates, face);
+        wstr(face)
+    }
+}
+
+fn mono_face() -> &'static [u16] {
+    MONO_FACE.get_or_init(|| resolve_face(MONO_CANDIDATES))
+}
+
+fn display_face() -> &'static [u16] {
+    DISPLAY_FACE.get_or_init(|| resolve_face(DISPLAY_CANDIDATES))
 }
 
 // ─── Row / section models shared by the three painters ───────────────────────
@@ -278,7 +325,7 @@ unsafe fn paint_floating(hwnd: HWND, state: &AppState) {
     let fh_row   = -(9  * dpi / 72);  // ~9pt for 11pt mono rows
 
     let fn_ui_bold = wstr("Segoe UI Semibold");
-    let fn_mono    = wstr("JetBrains Mono");
+    let fn_mono    = mono_face().to_vec();
     SetBkMode(hdc, TRANSPARENT);
 
     // Background
@@ -519,7 +566,7 @@ unsafe fn paint_appbar(hwnd: HWND, state: &AppState) {
     let fh_row   = -px_row;
     let fh_badge = -px_badge;
 
-    let fn_mono = wstr("JetBrains Mono");
+    let fn_mono = mono_face().to_vec();
 
     let mem_dc  = CreateCompatibleDC(hdc);
     let mem_bmp = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
@@ -1193,8 +1240,8 @@ unsafe fn paint_floating_neon(hwnd: HWND, state: &AppState) {
     let w = rc.right;
     let h = rc.bottom;
 
-    let fn_mono = wstr(FONT_MONO);
-    let fn_disp = wstr(FONT_DISPLAY);
+    let fn_mono = mono_face().to_vec();
+    let fn_disp = display_face().to_vec();
     SetBkMode(hdc, TRANSPARENT);
 
     // ── Base: background, scanlines every 4px, dot grid every 8px ────────────
@@ -1365,15 +1412,16 @@ unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
     let h = rc.bottom;
 
     let scale = (h.max(1) as f32) / 40.0;
-    let fn_mono = wstr(FONT_MONO);
+    let fn_mono = mono_face().to_vec();
 
     let mem_dc  = CreateCompatibleDC(hdc);
     let mem_bmp = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
     let old_bmp = SelectObject(mem_dc, mem_bmp);
     SetBkMode(mem_dc, TRANSPARENT);
 
-    gdi_fill(mem_dc, 0, 0, w, h, BAR_BG);
-    gdi_hline(mem_dc, 0, 0, w, CYAN_DIM);
+    // Transparent plate: paint the sampled taskbar colour so the band blends in.
+    let bg = sample_taskbar_color(hwnd).unwrap_or(BAR_BG);
+    gdi_fill(mem_dc, 0, 0, w, h, bg);
 
     let widths = appbar_col_widths(&state.settings);
     let sections = neon_sections(state);
@@ -1386,7 +1434,7 @@ unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
         } else {
             (widths.get(i).copied().unwrap_or(176) as f32 * scale).round() as i32
         };
-        draw_neon_dock_col(mem_dc, &fn_mono, x_off, col_w, h, sec);
+        draw_neon_dock_col(mem_dc, &fn_mono, x_off, col_w, h, sec, bg);
         x_off += col_w;
     }
 
@@ -1399,11 +1447,11 @@ unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
 
 /// One AppBar column: full-height glowing brand stripe (also the divider) + stacked rows.
 /// Row anatomy at 96 dpi: label 28 | 14-segment bar 55 | pct 28 | eta 32, gap 4; rows 9px.
-unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i32, sec: &SectionDef) {
+unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i32,
+                             sec: &SectionDef, bg: u32) {
     use neon::*;
     let scale = (h.max(1) as f32) / 40.0;
     let sc = |v: i32| ((v as f32) * scale).round().max(1.0) as i32;
-    let bg = BAR_BG;
 
     // Stripe with a two-step halo on its right.
     let stripe_w = sc(4);

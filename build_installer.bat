@@ -31,6 +31,6 @@ if errorlevel 1 (
 
 echo.
 echo ============================================
-echo  Done!  UsageMonitor-0.5.0-Setup.exe
+echo  Done!  UsageMonitor-0.5.1-Setup.exe
 echo ============================================
 pause
