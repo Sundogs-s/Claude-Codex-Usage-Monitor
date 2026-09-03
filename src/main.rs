@@ -24,8 +24,8 @@ use simplelog::{CombinedLogger, Config, SharedLogger};
 #[cfg(debug_assertions)]
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 use state::{
-    appbar_col_widths, calc_window_height, load_settings, new_shared, save_settings,
-    DisplayMode, LayoutInfo, MonitorInfo, RefreshRate, Settings, SharedState, APPBAR_COL_W,
+    appbar_col_widths, calc_window_height, effective_win_w, load_settings, new_shared, save_settings,
+    DisplayMode, LayoutInfo, MonitorInfo, RefreshRate, Settings, SharedState, Theme, APPBAR_COL_W,
 };
 use std::fs::OpenOptions;
 use std::path::PathBuf;
@@ -107,6 +107,8 @@ const IDM_MANUAL_REFRESH:  u32 = 150;
 const IDM_AUTOSTART:       u32 = 301;
 const IDM_EXIT:           u32 = 400;
 const IDM_MONITOR_BASE:   u32 = 500; // +index per monitor
+const IDM_THEME_CLASSIC:  u32 = 601;
+const IDM_THEME_NEON:     u32 = 602;
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
 //
@@ -539,7 +541,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
 
     match settings.display_mode {
         DisplayMode::Floating => {
-            let fw = settings.win_w.max(MIN_W);
+            let fw = effective_win_w(&settings).max(MIN_W);
             let fh = if settings.win_h < MIN_H { calc_window_height(&settings, layout) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
@@ -562,7 +564,7 @@ fn apply_window_layout(hwnd: HWND, state: &SharedState) {
         }
         DisplayMode::CompactBar => {
             // CompactBar mode removed: treat as Floating for backward-compatible settings.
-            let fw = settings.win_w.max(MIN_W);
+            let fw = effective_win_w(&settings).max(MIN_W);
             let fh = if settings.win_h < MIN_H { calc_window_height(&settings, layout) } else { settings.win_h };
             let fx = if settings.win_x < 0 { ml + mw - fw - 16 } else { settings.win_x };
             let fy = if settings.win_y < 0 { mt + mh - fh - 48 } else { settings.win_y };
@@ -674,6 +676,15 @@ fn show_context_menu(hwnd: HWND, state: &SharedState) {
             IDM_MODE_FLOAT  as usize, w!("浮动悬窗")).ok();
         AppendMenuW(hmenu, MF_STRING | mf(DisplayMode::AppBar),
             IDM_MODE_APPBAR as usize, w!("嵌入任务栏 (AppBar)")).ok();
+
+        // ── Theme (radio-style submenu) ───────────────────────────────────
+        let h_theme = CreatePopupMenu().unwrap_or_default();
+        let tf = |t: Theme| if settings.theme == t { MF_CHECKED } else { MF_UNCHECKED };
+        AppendMenuW(h_theme, MF_STRING | tf(Theme::Neon),
+            IDM_THEME_NEON as usize, w!("Neon HUD（赛博）")).ok();
+        AppendMenuW(h_theme, MF_STRING | tf(Theme::Classic),
+            IDM_THEME_CLASSIC as usize, w!("Classic（经典）")).ok();
+        AppendMenuW(hmenu, MF_POPUP, h_theme.0 as usize, w!("主题")).ok();
 
         AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()).ok();
 
@@ -831,6 +842,24 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
                 save_settings(&state.lock().settings);
                 apply_window_layout(hwnd, state);
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+
+            IDM_THEME_CLASSIC | IDM_THEME_NEON => {
+                let theme = if cmd == IDM_THEME_NEON { Theme::Neon } else { Theme::Classic };
+                {
+                    let mut s = state.lock();
+                    if s.settings.theme != theme {
+                        s.settings.theme = theme;
+                        // Size follows the theme: width back to the theme default, height auto.
+                        s.settings.win_w = -1;
+                        s.settings.win_h = -1;
+                    }
+                    save_settings(&s.settings);
+                }
+                overlay::set_theme(theme);
+                info!("[theme] switched to {:?}", theme);
+                apply_window_layout(hwnd, state);
+                InvalidateRect(hwnd, None, false).ok();
             }
 
             IDM_SHOW_TASKBAR => {
@@ -1062,6 +1091,7 @@ fn main() -> Result<()> {
             settings.display_mode = DisplayMode::Floating;
             save_settings(&settings);
         }
+        overlay::set_theme(settings.theme);
         let monitors  = enum_monitors();
         info!("Found {} monitors", monitors.len());
 
@@ -1081,7 +1111,7 @@ fn main() -> Result<()> {
 
         let (wx, wy, ww, wh) = match settings.display_mode {
             DisplayMode::Floating => {
-                let fw = settings.win_w.max(MIN_W);
+                let fw = effective_win_w(&settings).max(MIN_W);
                 // Use calc_window_height when win_h is -1 (auto) or from settings.
                 // No data yet at startup → 2 Claude rows; WM_APP resizes once rows arrive.
                 let fh = if settings.win_h < MIN_H {
@@ -1094,7 +1124,7 @@ fn main() -> Result<()> {
                 (fx, fy, fw, fh)
             }
             DisplayMode::CompactBar => {
-                let fw = settings.win_w.max(MIN_W);
+                let fw = effective_win_w(&settings).max(MIN_W);
                 let fh = if settings.win_h < MIN_H {
                     calc_window_height(&settings, LayoutInfo { claude_rows: 2, banner: false })
                 } else {

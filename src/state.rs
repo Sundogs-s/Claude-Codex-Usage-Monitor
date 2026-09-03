@@ -81,6 +81,22 @@ pub enum DisplayMode {
 }
 impl Default for DisplayMode { fn default() -> Self { Self::Floating } }
 
+/// Visual theme (switchable from the tray menu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    /// v0.4 look: rounded dark panel, gradient bars, Segoe UI headings.
+    Classic,
+    /// v0.5 "Neon HUD": 8px pixel grid, segmented glowing bars, cyan structure lines.
+    Neon,
+}
+impl Default for Theme { fn default() -> Self { Self::Neon } }
+impl Theme {
+    /// Default floating-window width for the theme (used when `win_w` is -1 = auto).
+    pub fn default_width(self) -> i32 {
+        match self { Theme::Classic => 320, Theme::Neon => 240 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum RefreshRate { Secs5, Min1, Min5 }
 impl Default for RefreshRate { fn default() -> Self { Self::Min1 } }
@@ -94,6 +110,8 @@ impl RefreshRate {
 pub struct Settings {
     #[serde(default)]
     pub display_mode:    DisplayMode,
+    #[serde(default)]
+    pub theme:           Theme,
     /// Index into the monitor list (0 = primary).
     #[serde(default)]
     pub monitor_idx:     usize,
@@ -120,7 +138,7 @@ pub struct Settings {
     pub win_x: i32,
     #[serde(default = "default_neg")]
     pub win_y: i32,
-    /// Saved size — width is fixed at DEFAULT_W; height auto-computed
+    /// Saved size — width -1 = theme default (see `effective_win_w`); height auto-computed
     /// when any section toggle changes (win_h = -1 signals auto mode).
     #[serde(default = "default_win_w")]
     pub win_w: i32,
@@ -130,12 +148,18 @@ pub struct Settings {
 
 fn default_true()  -> bool { true }
 fn default_neg()   -> i32  { -1 }
-fn default_win_w() -> i32  { 320 }
+fn default_win_w() -> i32  { -1 }
+
+/// Floating-window width: the saved value, or the theme default when unset (-1).
+pub fn effective_win_w(s: &Settings) -> i32 {
+    if s.win_w < 0 { s.theme.default_width() } else { s.win_w }
+}
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             display_mode:    DisplayMode::Floating,
+            theme:           Theme::Neon,
             monitor_idx:     0,
             refresh_rate:    RefreshRate::Min1,
             auto_start:      false,
@@ -145,7 +169,7 @@ impl Default for Settings {
             show_codex:      true,
             show_cursor:     true,
             win_x: -1, win_y: -1,
-            win_w: 320, win_h: -1,   // -1 → auto-compute on first paint
+            win_w: -1, win_h: -1,    // -1 → theme default width / auto height
         }
     }
 }
@@ -169,9 +193,25 @@ pub const BOTTOM_PAD:   i32 = 12;
 /// Bottom banner (stale / error line) height when shown.
 pub const BANNER_H:     i32 = 16;
 
-/// Height of a section holding `rows` data rows (2 rows = SECTION_H).
+/// Height of a section holding `rows` data rows (2 rows = SECTION_H). Classic theme.
 pub fn section_height(rows: usize) -> i32 {
     SECTION_H + (rows.max(2) as i32 - 2) * ROW_PITCH
+}
+
+// ─── Neon HUD metrics — everything is a multiple of the 8px pixel grid ────────
+//
+//   header 24 | section: pad 8 + head 16 + rows×16 + pad 8 | divider gap 8 | banner 16 | foot 8
+//   window 240 wide: pad 16 | label 32 | bar 80 | pct 32 | eta 40 | pad 16 (gaps 8)
+pub const NEON_HEADER_H:    i32 = 24;
+pub const NEON_SEC_PAD:     i32 = 8;
+pub const NEON_HEAD_H:      i32 = 16;
+pub const NEON_ROW_H:       i32 = 16;
+pub const NEON_DIVIDER_GAP: i32 = 8;
+pub const NEON_BANNER_H:    i32 = 16;
+pub const NEON_BOTTOM_PAD:  i32 = 8;
+
+pub fn neon_section_height(rows: usize) -> i32 {
+    NEON_SEC_PAD * 2 + NEON_HEAD_H + rows.max(2) as i32 * NEON_ROW_H
 }
 
 /// Layout inputs derived from live state (not settings).
@@ -183,33 +223,47 @@ pub struct LayoutInfo {
     pub banner:      bool,
 }
 
-/// AppBar column widths for the visible sections (Claude is wider to fit 3 rows).
+/// AppBar column widths at 96 dpi for the visible sections.
+/// Classic: Claude 200 (three rows), others 180. Neon: every column 176 (stripe 4 + 9 + rows 155 + 8).
 pub const APPBAR_COL_W:        i32 = 180;
 pub const APPBAR_CLAUDE_COL_W: i32 = 200;
+pub const NEON_APPBAR_COL_W:   i32 = 176;
 
 pub fn appbar_col_widths(settings: &Settings) -> Vec<i32> {
+    let (claude_w, other_w) = match settings.theme {
+        Theme::Classic => (APPBAR_CLAUDE_COL_W, APPBAR_COL_W),
+        Theme::Neon    => (NEON_APPBAR_COL_W, NEON_APPBAR_COL_W),
+    };
     let mut v = Vec::new();
-    if settings.show_claude { v.push(APPBAR_CLAUDE_COL_W); }
-    if settings.show_codex  { v.push(APPBAR_COL_W); }
-    if settings.show_cursor { v.push(APPBAR_COL_W); }
+    if settings.show_claude { v.push(claude_w); }
+    if settings.show_codex  { v.push(other_w); }
+    if settings.show_cursor { v.push(other_w); }
     v
 }
 
 /// Compute the preferred floating-window height for the currently enabled sections.
 /// Returns at least 132 (MIN_H) so the window is never empty.
 pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
+    let neon = settings.theme == Theme::Neon;
+    let sec_h = |rows: usize| if neon { neon_section_height(rows) } else { section_height(rows) };
+
     let mut heights: Vec<i32> = Vec::new();
-    if settings.show_claude { heights.push(section_height(layout.claude_rows)); }
-    if settings.show_codex  { heights.push(SECTION_H); }
-    if settings.show_cursor { heights.push(SECTION_H); }
+    if settings.show_claude { heights.push(sec_h(layout.claude_rows)); }
+    if settings.show_codex  { heights.push(sec_h(2)); }
+    if settings.show_cursor { heights.push(sec_h(2)); }
 
     let n = heights.len() as i32;
     if n == 0 {
         return 132;
     }
 
-    let banner = if layout.banner { BANNER_H } else { 0 };
-    let h = HEADER_H + heights.iter().sum::<i32>() + (n - 1) * DIVIDER_GAP + banner + BOTTOM_PAD;
+    let (header, gap, banner_h, foot) = if neon {
+        (NEON_HEADER_H, NEON_DIVIDER_GAP, NEON_BANNER_H, NEON_BOTTOM_PAD)
+    } else {
+        (HEADER_H, DIVIDER_GAP, BANNER_H, BOTTOM_PAD)
+    };
+    let banner = if layout.banner { banner_h } else { 0 };
+    let h = header + heights.iter().sum::<i32>() + (n - 1) * gap + banner + foot;
     h.max(132)
 }
 

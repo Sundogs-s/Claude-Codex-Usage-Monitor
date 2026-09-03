@@ -6,7 +6,7 @@ Unicode True
 
 !define APP_NAME        "Usage Monitor"
 !define APP_EXE         "usage-monitor.exe"
-!define APP_VERSION     "0.4.0"
+!define APP_VERSION     "0.5.0"
 !define PUBLISHER       "Sundogs"
 !define INSTALL_DIR     "$PROGRAMFILES64\UsageMonitor"
 !define REG_KEY         "Software\Microsoft\Windows\CurrentVersion\Uninstall\UsageMonitor"

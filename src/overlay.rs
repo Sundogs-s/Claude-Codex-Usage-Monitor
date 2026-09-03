@@ -26,11 +26,13 @@
 ///
 /// Compact-bar mode (full monitor width × 38px, floating above taskbar): same rows, stacked.
 use crate::state::{
-    appbar_col_widths, fmt_age, fmt_countdown, fmt_pct, secs_until, section_height,
-    AppState, DisplayMode, BANNER_H, BOTTOM_PAD, DIVIDER_GAP,
+    appbar_col_widths, fmt_age, fmt_countdown, fmt_pct, neon_section_height, secs_until,
+    section_height, AppState, DisplayMode, Theme, BANNER_H, BOTTOM_PAD, DIVIDER_GAP,
+    NEON_BANNER_H, NEON_BOTTOM_PAD, NEON_DIVIDER_GAP, NEON_HEADER_H, NEON_HEAD_H, NEON_ROW_H,
+    NEON_SEC_PAD,
 };
 use log::{debug, info};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use windows::{
     core::PCWSTR,
     Win32::{
@@ -40,7 +42,7 @@ use windows::{
             CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
             EndPaint, FillRect, GetDeviceCaps, GetPixel, GetWindowDC, HFONT, LineTo, MoveToEx,
             Polygon, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetPolyFillMode,
-            SetTextColor, SetWindowRgn, ALTERNATE, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT,
+            SetTextCharacterExtra, SetTextColor, SetWindowRgn, ALTERNATE, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT,
             DT_SINGLELINE, DT_VCENTER, DRAW_TEXT_FORMAT, HDC, LOGPIXELSX, PAINTSTRUCT, PS_NULL,
             PS_SOLID, SRCCOPY, TRANSPARENT,
         },
@@ -220,10 +222,22 @@ fn row_colors(util: Option<f32>, hi: u32, mid: u32, lo: u32, dim: bool) -> (u32,
     }
 }
 
-// ─── Rounded window region ────────────────────────────────────────────────────
+// ─── Theme (mirrored here so the window-region helper can read it without state) ──
+static THEME: AtomicU8 = AtomicU8::new(1); // 0 = Classic, 1 = Neon
+
+pub fn set_theme(t: Theme) {
+    THEME.store(if t == Theme::Neon { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+fn current_theme() -> Theme {
+    if THEME.load(Ordering::Relaxed) == 1 { Theme::Neon } else { Theme::Classic }
+}
+
+// ─── Window region: rounded 14px for Classic, square for Neon ─────────────────
 pub fn apply_rounded_region(hwnd: HWND, w: i32, h: i32) {
     unsafe {
-        let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, 14, 14);
+        let r = if current_theme() == Theme::Neon { 0 } else { 14 };
+        let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r);
         SetWindowRgn(hwnd, hrgn, true);
     }
 }
@@ -231,15 +245,18 @@ pub fn apply_rounded_region(hwnd: HWND, w: i32, h: i32) {
 // ─── Public paint entry ───────────────────────────────────────────────────────
 pub fn paint(hwnd: HWND, state: &AppState) {
     debug!(
-        "[paint] c5h={:?} c7d={:?} stale={} | x5h={:?} x7d={:?}",
+        "[paint] theme={:?} c5h={:?} c7d={:?} stale={} | x5h={:?} x7d={:?}",
+        state.settings.theme,
         state.claude.util("5h"), state.claude.util("7d"), state.claude_stale,
         state.codex.utilization_5h,  state.codex.utilization_7d,
     );
     unsafe {
-        match state.settings.display_mode {
-            DisplayMode::Floating   => paint_floating(hwnd, state),
-            DisplayMode::CompactBar => paint_compact(hwnd, state),
-            DisplayMode::AppBar     => paint_appbar(hwnd, state),
+        match (state.settings.theme, state.settings.display_mode) {
+            (Theme::Neon, DisplayMode::AppBar) => paint_appbar_neon(hwnd, state),
+            (Theme::Neon, _)                   => paint_floating_neon(hwnd, state),
+            (Theme::Classic, DisplayMode::Floating)   => paint_floating(hwnd, state),
+            (Theme::Classic, DisplayMode::CompactBar) => paint_compact(hwnd, state),
+            (Theme::Classic, DisplayMode::AppBar)     => paint_appbar(hwnd, state),
         }
     }
 }
@@ -944,7 +961,511 @@ unsafe fn gdi_vline(hdc: HDC, x: i32, y1: i32, y2: i32, color: u32) {
 
 
 unsafe fn gdi_text(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32, flags: DRAW_TEXT_FORMAT) {
+    // wstr() appends a NUL; DrawTextW takes a length-delimited slice, so drop it —
+    // otherwise fonts with a visible .notdef glyph (Bahnschrift) paint a box after the text.
     let mut ws = wstr(text);
+    let n = ws.len().saturating_sub(1);
     let mut rc = RECT { left: x, top: y, right: x + w, bottom: y + h };
-    DrawTextW(hdc, &mut ws, &mut rc, flags);
+    DrawTextW(hdc, &mut ws[..n], &mut rc, flags);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Neon HUD theme (v0.5) — 8px pixel grid, segmented glowing bars, cyan structure.
+//
+// Floating (240 × auto):
+//   ┌─┐ USAGE//MONITOR                      ⬡ LIVE ┌─┐   header 24
+//   │ ▍CLAUDE                          MAX 5X · NOW│   section: pad 8 + head 16 + rows×16 + pad 8
+//   │  5H     ▮▮▮▮▮▮▮▮▮▮▮▮▯▯▯▯   78%  4h23m        │   row 16: label 32 | bar 80 | pct 32 | eta 40
+//   │  7D     ▮▮▮▮▯▯▯▯▯▯▯▯▯▯▯▯   22%  5d1h         │
+//   │  FABLE  ▮▮▮▮▮▮▮▯▯▯▯▯▯▯▯▯   41%  3d12h        │
+//   │ ──── ─────────────────────────────────────── │   divider gap 8 (line centred, cyan tick)
+//   └─┘                                          └─┘
+//
+// AppBar (40 tall, 176px columns): full-height glowing brand stripe 4px | rows 9px.
+// ═══════════════════════════════════════════════════════════════════════════════
+mod neon {
+    pub const BG:       u32 = 0x070A12;
+    pub const GRID:     u32 = 0x0C1822;
+    pub const LINE:     u32 = 0x143241;
+    pub const CYAN:     u32 = 0x4FE3FF;
+    pub const CYAN_DIM: u32 = 0x1E6F82;
+    pub const TEXT:     u32 = 0xD6E6F2;
+    pub const DIM:      u32 = 0x6B8A9C;
+    pub const LABEL:    u32 = 0x9FB4C4;
+    pub const OFF:      u32 = 0x10202B;
+    pub const WARN:     u32 = 0xFF2E63;
+    pub const STALE:    u32 = 0xFFB454;
+    pub const PCT:      u32 = 0xE8F4FF;
+    pub const BAR_BG:   u32 = 0x0B0E16;
+    /// (lo, hi) brand gradient ends.
+    pub const CLAUDE: (u32, u32) = (0xFF6A2A, 0xFFB454);
+    pub const CODEX:  (u32, u32) = (0x5B7CFF, 0x9AB0FF);
+    pub const CURSOR: (u32, u32) = (0xB9C7D6, 0xEAF2FA);
+    /// How far stale bars fade towards the background.
+    pub const STALE_FADE: f32 = 0.55;
+    pub const FONT_DISPLAY: &str = "Bahnschrift";
+    pub const FONT_MONO:    &str = "JetBrains Mono";
+}
+
+/// Text with a 1px halo in a blended colour (GDI "glow"). The halo must stay faint
+/// (≈80% towards the background) or small counters (E, O, D at 12px) fill in.
+unsafe fn glow_text(hdc: HDC, text: &str, x: i32, y: i32, w: i32, h: i32,
+                    flags: DRAW_TEXT_FORMAT, color: u32, bg: u32) {
+    let halo = blend(color, bg, 0.80);
+    SetTextColor(hdc, rgb(halo));
+    for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+        gdi_text(hdc, text, x + dx, y + dy, w, h, flags);
+    }
+    SetTextColor(hdc, rgb(color));
+    gdi_text(hdc, text, x, y, w, h, flags);
+}
+
+/// Solid rectangle with a 2-step halo.
+unsafe fn glow_fill(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: u32, bg: u32) {
+    gdi_fill(hdc, x - 2, y - 2, w + 4, h + 4, blend(color, bg, 0.84));
+    gdi_fill(hdc, x - 1, y - 1, w + 2, h + 2, blend(color, bg, 0.60));
+    gdi_fill(hdc, x, y, w, h, color);
+}
+
+/// Vertical gradient fill, `top` → `bottom`.
+unsafe fn neon_vgrad(hdc: HDC, x: i32, y: i32, w: i32, h: i32, top: u32, bottom: u32) {
+    for r in 0..h {
+        let t = if h > 1 { r as f32 / (h - 1) as f32 } else { 0.0 };
+        gdi_fill(hdc, x, y + r, w, 1, blend(top, bottom, t));
+    }
+}
+
+/// Segmented bar: `seg_w`-wide blocks with `gap` between, as many as fit `bar_w`.
+/// Lit blocks carry the brand gradient and a halo; unlit blocks are OFF.
+#[allow(clippy::too_many_arguments)]
+unsafe fn neon_seg_bar(hdc: HDC, x: i32, y: i32, bar_w: i32, h: i32, seg_w: i32, gap: i32,
+                       util: Option<f32>, lo: u32, hi: u32, bg: u32, dim: bool) {
+    let n = ((bar_w + gap) / (seg_w + gap)).max(1);
+    let lit = util.map(|u| (u * n as f32).round() as i32).unwrap_or(0).clamp(0, n);
+    let (lo, hi) = if dim {
+        (blend(lo, bg, neon::STALE_FADE), blend(hi, bg, neon::STALE_FADE))
+    } else {
+        (lo, hi)
+    };
+    if !dim {
+        let halo = blend(hi, bg, 0.62);
+        for i in 0..lit {
+            let sx = x + i * (seg_w + gap);
+            gdi_fill(hdc, sx - 1, y - 1, seg_w + 2, h + 2, halo);
+        }
+    }
+    for i in 0..n {
+        let sx = x + i * (seg_w + gap);
+        if i < lit {
+            neon_vgrad(hdc, sx, y, seg_w, h, hi, lo);
+        } else {
+            gdi_fill(hdc, sx, y, seg_w, h, neon::OFF);
+        }
+    }
+}
+
+/// Hexagon status glyph (outline + centre dot).
+unsafe fn draw_hex(hdc: HDC, cx: i32, cy: i32, r: i32, color: u32, bg: u32) {
+    let pts = |rr: i32| -> [POINT; 6] {
+        let dx = (rr as f32 * 0.866) as i32;
+        let dy = rr / 2;
+        [
+            POINT { x: cx,      y: cy - rr },
+            POINT { x: cx + dx, y: cy - dy },
+            POINT { x: cx + dx, y: cy + dy },
+            POINT { x: cx,      y: cy + rr },
+            POINT { x: cx - dx, y: cy + dy },
+            POINT { x: cx - dx, y: cy - dy },
+        ]
+    };
+    for (rr, col) in [(r + 1, blend(color, bg, 0.7)), (r, color), (r - 2, bg)] {
+        if rr <= 0 { continue; }
+        let b = CreateSolidBrush(rgb(col));
+        let p = CreatePen(PS_NULL, 0, rgb(col));
+        let ob = SelectObject(hdc, b);
+        let op = SelectObject(hdc, p);
+        let _ = Polygon(hdc, &pts(rr));
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(b);
+        DeleteObject(p);
+    }
+    gdi_fill(hdc, cx - 1, cy - 1, 3, 3, color);
+}
+
+/// Corner bracket: 8px L-shape, 2px thick, with halo. `sx`/`sy` = ±1 direction.
+unsafe fn neon_corner(hdc: HDC, x: i32, y: i32, sx: i32, sy: i32) {
+    let halo = blend(neon::CYAN, neon::BG, 0.66);
+    let rect = |len: i32, thick: i32, horiz: bool| -> (i32, i32, i32, i32) {
+        let (w, h) = if horiz { (len, thick) } else { (thick, len) };
+        let x0 = if sx > 0 { x } else { x - w + 1 };
+        let y0 = if sy > 0 { y } else { y - h + 1 };
+        (x0, y0, w, h)
+    };
+    for (len, thick, col) in [(9, 3, halo), (8, 2, neon::CYAN)] {
+        let (a, b, c, d) = rect(len, thick, true);
+        gdi_fill(hdc, a, b, c, d, col);
+        let (a, b, c, d) = rect(len, thick, false);
+        gdi_fill(hdc, a, b, c, d, col);
+    }
+}
+
+fn neon_brand(name: &str) -> (u32, u32) {
+    match name {
+        "Claude" => neon::CLAUDE,
+        "Codex"  => neon::CODEX,
+        _        => neon::CURSOR,
+    }
+}
+
+/// Map the classic meta colour onto the neon palette.
+fn neon_meta_color(classic: u32) -> u32 {
+    match classic {
+        WARN_MID => neon::WARN,
+        STALE    => neon::STALE,
+        _        => neon::DIM,
+    }
+}
+
+/// Status chip text + colour for the header.
+fn neon_status(state: &AppState) -> (&'static str, u32) {
+    let st = &state.settings;
+    let any_err = (st.show_claude && !state.claude_error.is_empty())
+        || (st.show_codex && !state.codex_error.is_empty())
+        || (st.show_cursor && !state.cursor_error.is_empty());
+    if any_err { ("ERR", neon::WARN) }
+    else if st.show_claude && state.claude_stale { ("STALE", neon::STALE) }
+    else { ("LIVE", neon::CYAN) }
+}
+
+/// Short uppercase banner for the neon footer.
+fn neon_banner(state: &AppState) -> Option<(String, u32)> {
+    let (text, col) = banner_text(state)?;
+    let col = neon_meta_color(col);
+    if state.claude_stale && col == neon::DIM {
+        let retry = state.claude_next_retry
+            .map(|t| fmt_countdown(secs_until(Some(t))))
+            .unwrap_or_else(|| "soon".to_string());
+        return Some((format!("CLAUDE · RATE-LIMITED · RETRY {}", retry.to_uppercase()), neon::STALE));
+    }
+    // Errors: drop the parenthesised detail, uppercase the rest.
+    let short = text.split(" (").next().unwrap_or(&text).replace(':', " ·");
+    Some((short.to_uppercase(), col))
+}
+
+fn neon_sections(state: &AppState) -> Vec<SectionDef> {
+    let mut sections = Vec::new();
+    let st = &state.settings;
+    if st.show_claude {
+        let (meta, meta_col) = claude_meta(state);
+        let (lo, hi) = neon::CLAUDE;
+        sections.push(SectionDef {
+            name: "Claude", hi, mid: hi, lo,
+            rows: claude_rows(state),
+            meta, meta_col: neon_meta_color(meta_col),
+            dim: state.claude_stale, is_cursor: false,
+        });
+    }
+    if st.show_codex {
+        let (lo, hi) = neon::CODEX;
+        sections.push(SectionDef {
+            name: "Codex", hi, mid: hi, lo, rows: codex_rows(state),
+            meta: String::new(), meta_col: neon::DIM, dim: false, is_cursor: false,
+        });
+    }
+    if st.show_cursor {
+        let (lo, hi) = neon::CURSOR;
+        sections.push(SectionDef {
+            name: "Cursor", hi, mid: hi, lo, rows: cursor_rows(state),
+            meta: String::new(), meta_col: neon::DIM, dim: false, is_cursor: true,
+        });
+    }
+    sections
+}
+
+// ─── Neon floating window ─────────────────────────────────────────────────────
+unsafe fn paint_floating_neon(hwnd: HWND, state: &AppState) {
+    use neon::*;
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc).ok();
+    let w = rc.right;
+    let h = rc.bottom;
+
+    let fn_mono = wstr(FONT_MONO);
+    let fn_disp = wstr(FONT_DISPLAY);
+    SetBkMode(hdc, TRANSPARENT);
+
+    // ── Base: background, scanlines every 4px, dot grid every 8px ────────────
+    gdi_fill(hdc, 0, 0, w, h, BG);
+    let scan = blend(BG, 0x000000, 0.10);
+    let mut y = 0;
+    while y < h { gdi_fill(hdc, 0, y, w, 1, scan); y += 4; }
+    let mut gy = 0;
+    while gy < h {
+        let mut gx = 0;
+        while gx < w { gdi_fill(hdc, gx, gy, 1, 1, GRID); gx += 8; }
+        gy += 8;
+    }
+
+    // ── Header: cyan wash fading to the right, 1px base line ─────────────────
+    let hh = NEON_HEADER_H;
+    gdi_grad_bar(hdc, 0, 0, w * 6 / 10, hh - 1, blend(BG, CYAN, 0.10), blend(BG, CYAN, 0.05), BG);
+    gdi_hline(hdc, 0, hh - 1, w, LINE);
+
+    let hft = make_font_weight(&fn_disp, -13, 700);
+    let old = SelectObject(hdc, hft);
+    SetTextCharacterExtra(hdc, 2);
+    glow_text(hdc, "USAGE//MONITOR", 16, 0, w - 90, hh - 1,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER, CYAN, BG);
+    SetTextCharacterExtra(hdc, 0);
+    SelectObject(hdc, old);
+    DeleteObject(hft);
+
+    // Status chip (hex glyph + LIVE / STALE / ERR), right-aligned at the 16px pad.
+    let (chip, chip_col) = neon_status(state);
+    let hfc = make_font_weight(&fn_mono, -9, 600);
+    let old = SelectObject(hdc, hfc);
+    SetTextCharacterExtra(hdc, 1);
+    let chip_w = 36;
+    glow_text(hdc, chip, w - 16 - chip_w, 0, chip_w, hh - 1,
+              DT_RIGHT | DT_SINGLELINE | DT_VCENTER, chip_col, BG);
+    SetTextCharacterExtra(hdc, 0);
+    SelectObject(hdc, old);
+    DeleteObject(hfc);
+    draw_hex(hdc, w - 16 - chip_w - 10, (hh - 1) / 2, 5, chip_col, BG);
+
+    // ── Frame: 1px border + four glowing corner brackets ─────────────────────
+    gdi_hline(hdc, 0, 0, w, LINE);
+    gdi_hline(hdc, 0, h - 1, w, LINE);
+    gdi_vline(hdc, 0, 0, h, LINE);
+    gdi_vline(hdc, w - 1, 0, h, LINE);
+    neon_corner(hdc, 0,     0,     1,  1);
+    neon_corner(hdc, w - 1, 0,     -1, 1);
+    neon_corner(hdc, 0,     h - 1, 1,  -1);
+    neon_corner(hdc, w - 1, h - 1, -1, -1);
+
+    // ── Sections ─────────────────────────────────────────────────────────────
+    let sections = neon_sections(state);
+    let mut sy = hh;
+    for (idx, sec) in sections.iter().enumerate() {
+        if idx > 0 {
+            let dy = sy - NEON_DIVIDER_GAP / 2;
+            gdi_hline(hdc, 16, dy, w - 32, LINE);
+            gdi_fill(hdc, 16, dy - 1, 16, 3, blend(CYAN, BG, 0.7));
+            gdi_fill(hdc, 16, dy, 16, 1, CYAN);
+        }
+        let sec_h = neon_section_height(sec.rows.len());
+        draw_neon_section(hdc, &fn_disp, &fn_mono, 0, sy, w, sec);
+        sy += sec_h + NEON_DIVIDER_GAP;
+    }
+
+    // ── Banner ───────────────────────────────────────────────────────────────
+    if let Some((text, col)) = neon_banner(state) {
+        let by = h - NEON_BOTTOM_PAD - NEON_BANNER_H;
+        draw_diamond(hdc, 16 + 3, by + NEON_BANNER_H / 2, 3, col);
+        let hfb = make_font_weight(&fn_mono, -9, 600);
+        let old = SelectObject(hdc, hfb);
+        glow_text(hdc, &text, 28, by, w - 44, NEON_BANNER_H,
+                  DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS, col, BG);
+        SelectObject(hdc, old);
+        DeleteObject(hfb);
+    }
+
+    EndPaint(hwnd, &ps);
+}
+
+/// One neon section: glowing brand stripe + uppercase name + meta, then N 16px rows.
+unsafe fn draw_neon_section(hdc: HDC, fn_disp: &[u16], fn_mono: &[u16],
+                            sx: i32, sy: i32, sw: i32, sec: &SectionDef) {
+    use neon::*;
+    let pad = 16;
+    let x0 = sx + pad;
+    let cw = sw - pad * 2;
+    let mut y = sy + NEON_SEC_PAD;
+
+    // Heading
+    glow_fill(hdc, x0, y + 2, 4, 12, sec.hi, BG);
+    let hfh = make_font_weight(fn_disp, -12, 600);
+    let old = SelectObject(hdc, hfh);
+    SetTextCharacterExtra(hdc, 1);
+    glow_text(hdc, &sec.name.to_uppercase(), x0 + 12, y, cw - 12 - 96, NEON_HEAD_H,
+              DT_LEFT | DT_SINGLELINE | DT_VCENTER, sec.hi, BG);
+    SetTextCharacterExtra(hdc, 0);
+    SelectObject(hdc, old);
+    DeleteObject(hfh);
+
+    if !sec.meta.is_empty() {
+        let hfm = make_font_weight(fn_mono, -9, 400);
+        let old = SelectObject(hdc, hfm);
+        SetTextColor(hdc, rgb(sec.meta_col));
+        gdi_text(hdc, &sec.meta.to_uppercase(), x0 + cw - 110, y, 110, NEON_HEAD_H,
+                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, old);
+        DeleteObject(hfm);
+    }
+    y += NEON_HEAD_H;
+
+    // Rows: label 32 | bar (flex, 80 at 240 wide) | pct 32 | eta 40, gaps 8
+    let label_w = 32;
+    let pct_w   = 32;
+    let eta_w   = 40;
+    let gap     = 8;
+    let bar_w   = (cw - label_w - gap - gap - pct_w - gap - eta_w).max(20);
+    let bar_x   = x0 + label_w + gap;
+    let pct_x   = bar_x + bar_w + gap;
+    let eta_x   = pct_x + pct_w + gap;
+
+    let hfl = make_font_weight(fn_mono, -10, 400);
+    let hfp = make_font_weight(fn_mono, -11, 600);
+    let hfe = make_font_weight(fn_mono, -9, 400);
+
+    for r in &sec.rows {
+        let old = SelectObject(hdc, hfl);
+        SetTextColor(hdc, rgb(if sec.dim { blend(LABEL, BG, 0.35) } else { LABEL }));
+        gdi_text(hdc, &r.label.to_uppercase(), x0, y, label_w, NEON_ROW_H,
+                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        let warn = r.util.unwrap_or(0.0) >= 0.80;
+        let (lo, hi) = if warn { (blend(WARN, BG, 0.3), WARN) } else { (sec.lo, sec.hi) };
+        neon_seg_bar(hdc, bar_x, y + (NEON_ROW_H - 6) / 2, bar_w, 6, 4, 1, r.util, lo, hi, BG, sec.dim);
+
+        SelectObject(hdc, hfp);
+        let pct_col = if warn { WARN } else { PCT };
+        if sec.dim {
+            SetTextColor(hdc, rgb(blend(pct_col, BG, 0.4)));
+            gdi_text(hdc, &fmt_pct(r.util), pct_x, y, pct_w, NEON_ROW_H,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        } else {
+            glow_text(hdc, &fmt_pct(r.util), pct_x, y, pct_w, NEON_ROW_H,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER, pct_col, BG);
+        }
+
+        SelectObject(hdc, hfe);
+        SetTextColor(hdc, rgb(DIM));
+        gdi_text(hdc, &fmt_countdown(r.secs), eta_x, y, eta_w, NEON_ROW_H,
+                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, old);
+        y += NEON_ROW_H;
+    }
+    DeleteObject(hfl);
+    DeleteObject(hfp);
+    DeleteObject(hfe);
+}
+
+// ─── Neon AppBar (taskbar band) ───────────────────────────────────────────────
+unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
+    use neon::*;
+    let mut ps = PAINTSTRUCT::default();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc).ok();
+    let w = rc.right;
+    let h = rc.bottom;
+
+    let scale = (h.max(1) as f32) / 40.0;
+    let fn_mono = wstr(FONT_MONO);
+
+    let mem_dc  = CreateCompatibleDC(hdc);
+    let mem_bmp = CreateCompatibleBitmap(hdc, w.max(1), h.max(1));
+    let old_bmp = SelectObject(mem_dc, mem_bmp);
+    SetBkMode(mem_dc, TRANSPARENT);
+
+    gdi_fill(mem_dc, 0, 0, w, h, BAR_BG);
+    gdi_hline(mem_dc, 0, 0, w, CYAN_DIM);
+
+    let widths = appbar_col_widths(&state.settings);
+    let sections = neon_sections(state);
+    let n_cols = sections.len();
+    let mut x_off = 0i32;
+    for (i, sec) in sections.iter().enumerate() {
+        let is_last = i + 1 == n_cols;
+        let col_w = if is_last {
+            (w - x_off).max(1)
+        } else {
+            (widths.get(i).copied().unwrap_or(176) as f32 * scale).round() as i32
+        };
+        draw_neon_dock_col(mem_dc, &fn_mono, x_off, col_w, h, sec);
+        x_off += col_w;
+    }
+
+    let _ = BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+    SelectObject(mem_dc, old_bmp);
+    DeleteObject(mem_bmp);
+    DeleteDC(mem_dc);
+    EndPaint(hwnd, &ps);
+}
+
+/// One AppBar column: full-height glowing brand stripe (also the divider) + stacked rows.
+/// Row anatomy at 96 dpi: label 28 | 14-segment bar 55 | pct 28 | eta 32, gap 4; rows 9px.
+unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i32, sec: &SectionDef) {
+    use neon::*;
+    let scale = (h.max(1) as f32) / 40.0;
+    let sc = |v: i32| ((v as f32) * scale).round().max(1.0) as i32;
+    let bg = BAR_BG;
+
+    // Stripe with a two-step halo on its right.
+    let stripe_w = sc(4);
+    gdi_fill(hdc, x + stripe_w, 0, sc(2), h, blend(sec.hi, bg, 0.72));
+    gdi_fill(hdc, x + stripe_w + sc(2), 0, sc(1), h, blend(sec.hi, bg, 0.88));
+    neon_vgrad(hdc, x, 0, stripe_w, h, sec.hi, sec.lo);
+
+    let label_w = sc(28);
+    let pct_w   = sc(28);
+    let eta_w   = sc(32);
+    let gap     = sc(4);
+    let row_h   = sc(9);
+    let bar_h   = sc(5);
+    let seg_w   = sc(3);
+    let seg_gap = sc(1);
+    let n       = sec.rows.len() as i32;
+    let rgap    = if n >= 3 { sc(3) } else { sc(7) };
+
+    let rx    = x + stripe_w + sc(9);
+    let right = x + col_w - sc(8);
+    let bar_x = rx + label_w + gap;
+    let bar_w = (right - bar_x - gap - pct_w - gap - eta_w).max(sc(16));
+    let pct_x = bar_x + bar_w + gap;
+    let eta_x = pct_x + pct_w + gap;
+
+    let total = n * row_h + (n - 1).max(0) * rgap;
+    let mut y = (h - total) / 2;
+
+    let hfl = make_font_weight(fn_mono, -sc(9), 400);
+    let hfp = make_font_weight(fn_mono, -sc(9), 600);
+    let hfe = make_font_weight(fn_mono, -sc(8), 400);
+
+    for r in &sec.rows {
+        let old = SelectObject(hdc, hfl);
+        SetTextColor(hdc, rgb(if sec.dim { blend(LABEL, bg, 0.35) } else { LABEL }));
+        gdi_text(hdc, &r.label.to_uppercase(), rx, y - 1, label_w, row_h + 2,
+                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        let warn = r.util.unwrap_or(0.0) >= 0.80;
+        let (lo, hi) = if warn { (blend(WARN, bg, 0.3), WARN) } else { (sec.lo, sec.hi) };
+        neon_seg_bar(hdc, bar_x, y + (row_h - bar_h) / 2, bar_w, bar_h, seg_w, seg_gap,
+                     r.util, lo, hi, bg, sec.dim);
+
+        SelectObject(hdc, hfp);
+        let pct_col = if warn { WARN } else { PCT };
+        if sec.dim {
+            SetTextColor(hdc, rgb(blend(pct_col, bg, 0.4)));
+            gdi_text(hdc, &fmt_pct(r.util), pct_x, y - 1, pct_w, row_h + 2,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        } else {
+            glow_text(hdc, &fmt_pct(r.util), pct_x, y - 1, pct_w, row_h + 2,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER, pct_col, bg);
+        }
+
+        SelectObject(hdc, hfe);
+        SetTextColor(hdc, rgb(DIM));
+        gdi_text(hdc, &fmt_countdown(r.secs), eta_x, y - 1, eta_w, row_h + 2,
+                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, old);
+        y += row_h + rgap;
+    }
+    DeleteObject(hfl);
+    DeleteObject(hfp);
+    DeleteObject(hfe);
 }
