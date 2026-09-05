@@ -1,4 +1,4 @@
-/// Claude usage data fetcher (v0.4).
+/// Claude usage data fetcher (v0.5.3).
 ///
 /// Strategy:
 ///   1. Read the OAuth token from ~\.claude\.credentials.json
@@ -13,11 +13,16 @@
 ///   3. HTTP 429 → `FetchError::RateLimited`. The caller keeps the last-known rows,
 ///      marks them stale and backs off. There is NO /v1/messages probe fallback for
 ///      OAuth tokens any more: that probe consumed quota and never carried Fable.
-///   4. Expired / rejected token → ask the Claude Code CLI itself through its headless
-///      stream-json control protocol (`get_usage`). The CLI refreshes the OAuth token
-///      with its own credential locking and answers with the same windows
-///      (rate_limits.model_scoped). This monitor never touches the refresh token, so it
-///      can never invalidate the Claude Code login.
+///   4. Expired / rejected token → silently launch the Claude Code CLI (no console
+///      window) and ask it through its headless stream-json control protocol
+///      (`get_usage`). The CLI refreshes the OAuth token with its own credential
+///      locking, writes the new token back to the credentials file and answers with
+///      the same windows (rate_limits.model_scoped). This monitor never touches the
+///      refresh token, so it can never invalidate the Claude Code login.
+///      The launch is bounded: at most `CLI_MAX_ATTEMPTS` per credentials-file
+///      generation (mtime + expiresAt), spaced by `CLI_RETRY_DELAYS`. The counter
+///      resets when the credentials file changes, on the tray "立即刷新" action, or
+///      on restart. A missing CLI stops the attempts immediately.
 ///   5. API-key credentials (no plan limits) → POST /v1/messages probe headers (5h/7d only).
 use crate::state::{ClaudeUsage, UsageRow};
 use chrono::{DateTime, Utc};
@@ -27,7 +32,7 @@ use reqwest::{header::HeaderMap, Client};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
 
 const OAUTH_BETA: &str = "oauth-2025-04-20";
@@ -35,13 +40,13 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Treat the token as expiring this long before `expiresAt` so a request never races expiry.
 const EXPIRY_MARGIN_MS: i64 = 5 * 60 * 1000;
-/// Hard timeout for one headless CLI round-trip.
-const CLI_TIMEOUT: Duration = Duration::from_secs(60);
-/// Minimum gap between two CLI spawns (the CLI is a full Claude Code process).
-const CLI_MIN_GAP: Duration = Duration::from_secs(120);
+/// Hard timeout for one headless CLI round-trip (cold start of the CLI takes a few seconds).
+const CLI_TIMEOUT: Duration = Duration::from_secs(90);
+/// Maximum CLI launches per credentials-file generation.
+const CLI_MAX_ATTEMPTS: u32 = 3;
+/// Wait before attempt N+1 after attempt N failed (index = attempts already made − 1).
+const CLI_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(300), Duration::from_secs(900)];
 const CLI_REQUEST_ID: &str = "usage-monitor";
-
-static LAST_CLI_SPAWN: Mutex<Option<Instant>> = Mutex::new(None);
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -49,8 +54,12 @@ static LAST_CLI_SPAWN: Mutex<Option<Instant>> = Mutex::new(None);
 pub enum FetchError {
     /// The usage endpoint answered 429. Keep last-known data and back off.
     RateLimited,
-    /// Credentials are unusable and the CLI could not refresh them.
+    /// Credentials are missing or unparsable: there is nothing to show.
     Auth(String),
+    /// The OAuth token is expired and the CLI refresh has not fixed it (yet).
+    /// Last-known rows stay visible as stale. `next_attempt` is the time of the next
+    /// CLI launch, or None when attempts are exhausted / the CLI is missing.
+    Expired { reason: String, next_attempt: Option<DateTime<Utc>> },
     Other(String),
 }
 
@@ -58,6 +67,7 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FetchError::RateLimited => write!(f, "usage API rate-limited"),
+            FetchError::Expired { reason, .. } => write!(f, "{}", reason),
             FetchError::Auth(s) | FetchError::Other(s) => write!(f, "{}", s),
         }
     }
@@ -111,7 +121,12 @@ struct LoadedToken {
     expires_at: Option<i64>, // ms
     is_api_key: bool,
     tier:       Option<String>,
+    /// Identity of the credentials-file contents: (mtime, expiresAt). Changes whenever
+    /// Claude Code rewrites the file, i.e. after every successful token refresh.
+    generation: Generation,
 }
+
+type Generation = (Option<SystemTime>, Option<i64>);
 
 /// "default_claude_max_5x" + "max" → "Max 5x"; falls back to the subscription type.
 fn tier_label(rate_limit_tier: Option<&str>, subscription: Option<&str>) -> Option<String> {
@@ -137,6 +152,7 @@ fn load_token() -> Result<LoadedToken, FetchError> {
             "Claude credentials not found. Open Claude Code once to sign in.".to_string()))?;
 
     debug!("[claude] reading credentials from {}", path.display());
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
 
     let creds: ClaudeCredentials = serde_json::from_str(&data)
         .map_err(|e| FetchError::Other(format!("credentials parse error in {}: {}", path.display(), e)))?;
@@ -151,13 +167,15 @@ fn load_token() -> Result<LoadedToken, FetchError> {
                 expires_at: oauth.expires_at,
                 is_api_key: false,
                 tier,
+                generation: (mtime, oauth.expires_at),
             });
         }
     }
     if let Some(key) = creds.api_key {
         if !key.is_empty() {
             info!("[claude] using api_key field");
-            return Ok(LoadedToken { token: key, expires_at: None, is_api_key: true, tier: None });
+            return Ok(LoadedToken { token: key, expires_at: None, is_api_key: true, tier: None,
+                                    generation: (mtime, None) });
         }
     }
     Err(FetchError::Auth("No Claude token in credentials file. Open Claude Code once to sign in.".to_string()))
@@ -344,12 +362,126 @@ struct CliUsageBody {
     subscription_type:     Option<String>,
 }
 
-fn cli_candidates() -> Vec<PathBuf> {
-    vec![
-        PathBuf::from("claude"),
-        home_dir().join(".local").join("bin").join("claude.exe"),
-        home_dir().join(".local").join("bin").join("claude"),
-    ]
+/// A resolved Claude Code CLI launcher.
+#[derive(Debug, Clone)]
+struct CliExe {
+    path:   PathBuf,
+    /// npm installs ship only a `claude.cmd` shim; CreateProcess cannot run it directly,
+    /// so it goes through `cmd /C`.
+    is_cmd: bool,
+}
+
+/// Locate the Claude Code CLI. Order: real executables (PATH, npm global
+/// node_modules, ~/.local/bin, ~/.claude/local), then `.cmd` shims on PATH.
+fn resolve_cli() -> Option<CliExe> {
+    let home = home_dir();
+    let appdata = PathBuf::from(std::env::var("APPDATA").unwrap_or_default());
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+
+    let mut exes: Vec<PathBuf> = path_dirs.iter().map(|d| d.join("claude.exe")).collect();
+    exes.push(appdata.join("npm").join("node_modules").join("@anthropic-ai")
+        .join("claude-code").join("bin").join("claude.exe"));
+    exes.push(home.join(".local").join("bin").join("claude.exe"));
+    exes.push(home.join(".claude").join("local").join("claude.exe"));
+    if let Some(p) = exes.into_iter().find(|p| p.is_file()) {
+        return Some(CliExe { path: p, is_cmd: false });
+    }
+
+    let mut cmds: Vec<PathBuf> = path_dirs.iter().map(|d| d.join("claude.cmd")).collect();
+    cmds.push(appdata.join("npm").join("claude.cmd"));
+    cmds.into_iter().find(|p| p.is_file()).map(|p| CliExe { path: p, is_cmd: true })
+}
+
+// ─── Bounded refresh attempts ────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+struct RefreshTracker {
+    generation:   Option<Generation>,
+    attempts:     u32,
+    next_allowed: Option<Instant>,
+    /// No CLI on this machine: nothing to retry until the user acts (manual refresh / restart).
+    cli_missing:  bool,
+}
+
+static TRACKER: Mutex<RefreshTracker> = Mutex::new(RefreshTracker {
+    generation: None, attempts: 0, next_allowed: None, cli_missing: false,
+});
+
+/// Forget all refresh attempts (tray "立即刷新"): the next poll may launch the CLI again.
+pub fn reset_refresh_attempts() {
+    let mut t = TRACKER.lock();
+    if t.attempts > 0 || t.cli_missing {
+        info!("[claude] CLI refresh attempts reset (manual)");
+    }
+    *t = RefreshTracker::default();
+}
+
+fn instant_to_utc(at: Instant) -> DateTime<Utc> {
+    let now = Instant::now();
+    if at <= now { Utc::now() } else { Utc::now() + chrono::Duration::from_std(at - now).unwrap_or_default() }
+}
+
+/// Decide whether a CLI launch is allowed right now for this credentials generation.
+/// Ok(attempt number) → go; Err(FetchError::Expired) → not now (reason + next time).
+fn tracker_begin_attempt(generation: &Generation) -> Result<u32, FetchError> {
+    let mut t = TRACKER.lock();
+    if t.generation.as_ref() != Some(generation) {
+        if t.generation.is_some() {
+            info!("[claude] credentials file changed — CLI refresh attempts reset");
+        }
+        *t = RefreshTracker { generation: Some(generation.clone()), ..Default::default() };
+    }
+    if t.cli_missing {
+        return Err(FetchError::Expired {
+            reason: "token expired · Claude CLI not found · open Claude Code once to refresh".into(),
+            next_attempt: None,
+        });
+    }
+    if t.attempts >= CLI_MAX_ATTEMPTS {
+        return Err(FetchError::Expired {
+            reason: format!("token expired · CLI refresh gave up after {} attempts · open Claude Code once",
+                            CLI_MAX_ATTEMPTS),
+            next_attempt: None,
+        });
+    }
+    if let Some(next) = t.next_allowed {
+        if next > Instant::now() {
+            return Err(FetchError::Expired {
+                reason: format!("token expired · CLI refresh retry in {}s", (next - Instant::now()).as_secs()),
+                next_attempt: Some(instant_to_utc(next)),
+            });
+        }
+    }
+    t.attempts += 1;
+    let n = t.attempts;
+    t.next_allowed = CLI_RETRY_DELAYS.get((n - 1) as usize).map(|d| Instant::now() + *d);
+    Ok(n)
+}
+
+/// Record the outcome of a CLI launch; returns the `Expired` error to surface on failure.
+fn tracker_after_failure(cli_missing: bool, detail: &str) -> FetchError {
+    let mut t = TRACKER.lock();
+    if cli_missing {
+        t.cli_missing = true;
+        return FetchError::Expired {
+            reason: format!("token expired · Claude CLI not found ({}) · open Claude Code once to refresh", detail),
+            next_attempt: None,
+        };
+    }
+    if t.attempts >= CLI_MAX_ATTEMPTS {
+        FetchError::Expired {
+            reason: format!("token expired · CLI refresh failed {} times ({}) · open Claude Code once",
+                            t.attempts, detail),
+            next_attempt: None,
+        }
+    } else {
+        FetchError::Expired {
+            reason: format!("token expired · CLI refresh failed ({}) · retrying later", detail),
+            next_attempt: t.next_allowed.map(instant_to_utc),
+        }
+    }
 }
 
 enum CliOutcome {
@@ -361,95 +493,109 @@ enum CliOutcome {
     NoPlanLimits,
 }
 
-async fn cli_get_usage() -> Result<CliOutcome, String> {
-    {
-        let mut last = LAST_CLI_SPAWN.lock();
-        if let Some(t) = *last {
-            if t.elapsed() < CLI_MIN_GAP {
-                return Err(format!("CLI refresh cooldown ({}s left)",
-                    (CLI_MIN_GAP - t.elapsed()).as_secs()));
-            }
+enum CliError {
+    NotFound(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::NotFound(s) | CliError::Failed(s) => write!(f, "{}", s),
         }
-        *last = Some(Instant::now());
     }
+}
+
+/// Launch the CLI once (no console window) and ask for `get_usage`.
+async fn cli_get_usage() -> Result<CliOutcome, CliError> {
+    let Some(exe) = resolve_cli() else {
+        warn!("[claude] Claude CLI not found on PATH / npm global / ~/.local/bin / ~/.claude/local");
+        return Err(CliError::NotFound("claude CLI not found".into()));
+    };
 
     let request = format!(
         "{{\"type\":\"control_request\",\"request_id\":\"{}\",\"request\":{{\"subtype\":\"get_usage\"}}}}\n",
         CLI_REQUEST_ID
     );
+    // --strict-mcp-config without --mcp-config: start no MCP servers at all.
+    // (--bare is NOT usable here: it disables OAuth, so the token could not be refreshed.)
+    let cli_args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json",
+                    "--verbose", "--strict-mcp-config"];
 
-    let mut last_err = String::from("claude CLI not found");
-    for exe in cli_candidates() {
-        let mut cmd = tokio::process::Command::new(&exe);
-        cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
-            .current_dir(std::env::temp_dir())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                last_err = format!("spawn {} failed: {}", exe.display(), e);
-                debug!("[claude] {}", last_err);
-                continue;
-            }
-        };
-        info!("[claude] CLI get_usage via {}", exe.display());
-
-        if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(request.as_bytes()).await {
-                warn!("[claude] CLI stdin write failed: {}", e);
-            }
-            let _ = stdin.shutdown().await;
-            drop(stdin);
-        }
-
-        let output = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
-            Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(format!("CLI wait failed: {}", e)),
-            Err(_) => return Err(format!("CLI timed out after {}s", CLI_TIMEOUT.as_secs())),
-        };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            debug!("[claude] CLI stderr: {}", stderr.trim().chars().take(600).collect::<String>());
-        }
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if !line.contains("control_response") { continue; }
-            let Ok(env) = serde_json::from_str::<CliEnvelope>(line) else { continue };
-            if env.kind != "control_response" { continue; }
-            let Some(r) = env.response else { continue };
-            if r.request_id.as_deref() != Some(CLI_REQUEST_ID) { continue; }
-            if r.subtype != "success" {
-                return Err(format!("CLI get_usage error: {}", r.error.unwrap_or_default()));
-            }
-            let Some(body) = r.response else { return Err("CLI get_usage: empty response".into()) };
-            if body.rate_limits_available == Some(false) {
-                return Ok(CliOutcome::NoPlanLimits);
-            }
-            return match body.rate_limits {
-                Some(ur) => Ok(CliOutcome::Usage(ur, body.subscription_type)),
-                None => Ok(CliOutcome::RateLimited),
-            };
-        }
-
-        return Err(format!(
-            "CLI exited with {} without a get_usage response ({})",
-            output.status,
-            stderr.trim().lines().last().unwrap_or("").chars().take(200).collect::<String>()
-        ));
+    let mut cmd = if exe.is_cmd {
+        let mut c = tokio::process::Command::new("cmd.exe");
+        c.arg("/C").arg(&exe.path).args(cli_args);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(&exe.path);
+        c.args(cli_args);
+        c
+    };
+    cmd.current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    Err(last_err)
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("[claude] spawn {} failed: {}", exe.path.display(), e);
+            return Err(CliError::NotFound(format!("spawn {} failed: {}", exe.path.display(), e)));
+        }
+    };
+    info!("[claude] CLI get_usage via {}{}", exe.path.display(), if exe.is_cmd { " (cmd /C)" } else { "" });
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(request.as_bytes()).await {
+            warn!("[claude] CLI stdin write failed: {}", e);
+        }
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+    }
+
+    let output = match tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(CliError::Failed(format!("CLI wait failed: {}", e))),
+        Err(_) => return Err(CliError::Failed(format!("CLI timed out after {}s", CLI_TIMEOUT.as_secs()))),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        debug!("[claude] CLI stderr: {}", stderr.trim().chars().take(600).collect::<String>());
+    }
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.contains("control_response") { continue; }
+        let Ok(env) = serde_json::from_str::<CliEnvelope>(line) else { continue };
+        if env.kind != "control_response" { continue; }
+        let Some(r) = env.response else { continue };
+        if r.request_id.as_deref() != Some(CLI_REQUEST_ID) { continue; }
+        if r.subtype != "success" {
+            return Err(CliError::Failed(format!("CLI get_usage error: {}", r.error.unwrap_or_default())));
+        }
+        let Some(body) = r.response else { return Err(CliError::Failed("CLI get_usage: empty response".into())) };
+        if body.rate_limits_available == Some(false) {
+            return Ok(CliOutcome::NoPlanLimits);
+        }
+        return match body.rate_limits {
+            Some(ur) => Ok(CliOutcome::Usage(ur, body.subscription_type)),
+            None => Ok(CliOutcome::RateLimited),
+        };
+    }
+
+    Err(CliError::Failed(format!(
+        "CLI exited with {} without a get_usage response ({})",
+        output.status,
+        stderr.trim().lines().last().unwrap_or("").chars().take(200).collect::<String>()
+    )))
 }
 
 // ─── API-key fallback: POST /v1/messages, read rate-limit headers ─────────────
@@ -542,9 +688,30 @@ pub async fn fetch(client: &Client) -> Result<ClaudeUsage, FetchError> {
               loaded.expires_at);
     }
 
+    refresh_via_cli(&loaded, tier).await
+}
+
+/// Bounded CLI refresh: consult the tracker, launch at most once per call, and map the
+/// outcome. A success that did not rewrite the credentials file still counts as an
+/// attempt so a CLI that answers but never persists the token cannot be spawned forever.
+async fn refresh_via_cli(loaded: &LoadedToken, tier: Option<String>) -> Result<ClaudeUsage, FetchError> {
+    let attempt = tracker_begin_attempt(&loaded.generation)?;
+    info!("[claude] CLI refresh attempt {}/{}", attempt, CLI_MAX_ATTEMPTS);
+
     match cli_get_usage().await {
         Ok(CliOutcome::Usage(ur, sub)) => {
-            let tier = load_token().ok().and_then(|t| t.tier)
+            let reloaded = load_token().ok();
+            match reloaded.as_ref().map(|t| &t.generation) {
+                Some(g) if *g != loaded.generation => {
+                    info!("[claude] CLI refreshed the credentials file (new expires_at={:?})",
+                          reloaded.as_ref().and_then(|t| t.expires_at));
+                    *TRACKER.lock() = RefreshTracker::default();
+                }
+                _ => warn!("[claude] CLI answered but the credentials file did not change \
+                            (attempt {}/{}) — token will still read as expired next poll",
+                           attempt, CLI_MAX_ATTEMPTS),
+            }
+            let tier = reloaded.and_then(|t| t.tier)
                 .or(tier)
                 .or_else(|| tier_label(None, sub.as_deref()));
             let usage = build_usage(&ur, tier);
@@ -557,18 +724,24 @@ pub async fn fetch(client: &Client) -> Result<ClaudeUsage, FetchError> {
         }
         Ok(CliOutcome::NoPlanLimits) => Err(FetchError::Other(
             "This Claude login has no plan rate limits (API key / 3P provider)".to_string())),
-        Err(e) => {
+        Err(CliError::NotFound(e)) => {
+            warn!("[claude] CLI refresh impossible: {}", e);
+            Err(tracker_after_failure(true, &e))
+        }
+        Err(CliError::Failed(e)) => {
             warn!("[claude] CLI refresh failed: {}", e);
-            Err(FetchError::Auth(format!("token expired · open Claude Code once to refresh ({})", e)))
+            Err(tracker_after_failure(false, &e))
         }
     }
 }
 
 /// Diagnostic entry for `usage-monitor --probe [--cli]`: run one fetch and describe it.
-/// `force_cli` exercises the Claude Code CLI refresh path even with a valid token.
+/// `force_cli` exercises the Claude Code CLI refresh path even with a valid token and
+/// reports whether the CLI rewrote the credentials file.
 pub async fn probe(client: &Client, force_cli: bool) -> String {
     if force_cli {
-        return match cli_get_usage().await {
+        let before = load_token().ok().map(|t| t.generation);
+        let out = match cli_get_usage().await {
             Ok(CliOutcome::Usage(ur, sub)) => {
                 let tier = load_token().ok().and_then(|t| t.tier).or_else(|| tier_label(None, sub.as_deref()));
                 format!("CLI ok → {}", summarize(&build_usage(&ur, tier)))
@@ -577,6 +750,11 @@ pub async fn probe(client: &Client, force_cli: bool) -> String {
             Ok(CliOutcome::NoPlanLimits) => "CLI ok, no plan rate limits for this login".to_string(),
             Err(e) => format!("CLI failed: {}", e),
         };
+        let after = load_token().ok().map(|t| t.generation);
+        let cli = resolve_cli().map(|c| format!("{}{}", c.path.display(), if c.is_cmd { " (cmd /C)" } else { "" }))
+            .unwrap_or_else(|| "<not found>".into());
+        return format!("{} | cli={} | credentials file {}", out, cli,
+                       if before != after { "REWRITTEN (token refreshed)" } else { "unchanged" });
     }
     match fetch(client).await {
         Ok(u) => format!("ok → {} (tier={:?})", summarize(&u), u.tier),
@@ -590,4 +768,48 @@ fn summarize(u: &ClaudeUsage) -> String {
         .map(|r| format!("{}={}", r.label, r.utilization.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or("-".into())))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One test only: the tracker is a process-wide static.
+    #[test]
+    fn cli_refresh_attempts_are_bounded_and_resettable() {
+        reset_refresh_attempts();
+        let gen_a: Generation = (None, Some(1));
+        let gen_b: Generation = (None, Some(2));
+
+        // Attempt 1 goes immediately; attempt 2 must wait for the first delay.
+        assert_eq!(tracker_begin_attempt(&gen_a).ok(), Some(1));
+        match tracker_begin_attempt(&gen_a) {
+            Err(FetchError::Expired { next_attempt: Some(_), .. }) => {}
+            other => panic!("expected a scheduled retry, got {:?}", other.map(|_| ())),
+        }
+
+        // Exhaust the remaining attempts by clearing the delay each time.
+        for n in 2..=CLI_MAX_ATTEMPTS {
+            TRACKER.lock().next_allowed = None;
+            assert_eq!(tracker_begin_attempt(&gen_a).ok(), Some(n));
+        }
+        TRACKER.lock().next_allowed = None;
+        match tracker_begin_attempt(&gen_a) {
+            Err(FetchError::Expired { next_attempt: None, reason }) => assert!(reason.contains("gave up")),
+            other => panic!("expected exhaustion, got {:?}", other.map(|_| ())),
+        }
+
+        // A rewritten credentials file (new generation) starts over.
+        assert_eq!(tracker_begin_attempt(&gen_b).ok(), Some(1));
+
+        // A missing CLI stops attempts until a manual reset.
+        let _ = tracker_after_failure(true, "not found");
+        match tracker_begin_attempt(&gen_b) {
+            Err(FetchError::Expired { next_attempt: None, reason }) => assert!(reason.contains("CLI not found")),
+            other => panic!("expected cli-missing stop, got {:?}", other.map(|_| ())),
+        }
+        reset_refresh_attempts();
+        assert_eq!(tracker_begin_attempt(&gen_b).ok(), Some(1));
+        reset_refresh_attempts();
+    }
 }

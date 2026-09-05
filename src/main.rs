@@ -890,6 +890,7 @@ fn handle_menu(hwnd: HWND, cmd: u32, state: &SharedState, monitors: &[MonitorInf
             }
 
             IDM_MANUAL_REFRESH => {
+                claude::reset_refresh_attempts();
                 monitor::wake_pollers();
                 InvalidateRect(hwnd, None, false).ok();
             }

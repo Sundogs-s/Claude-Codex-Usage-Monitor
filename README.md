@@ -32,7 +32,7 @@
 - 自动刷新：Claude 接口轮询下限 120 秒，429 时指数退避到 15 分钟。
 
 ### 数据来源
-- Claude：读取 `~/.claude/.credentials.json` 的 OAuth token，请求 `https://api.anthropic.com/api/oauth/usage`。token 过期或被拒时通过 Claude Code CLI 的 headless `get_usage` 控制请求刷新，本程序不接触 refresh token，不会影响 Claude Code 登录态。
+- Claude：读取 `~/.claude/.credentials.json` 的 OAuth token，请求 `https://api.anthropic.com/api/oauth/usage`。token 过期或被拒时静默（无控制台窗口）拉起 Claude Code CLI，通过其 headless `get_usage` 控制请求刷新并回写凭证文件；本程序不接触 refresh token，不会影响 Claude Code 登录态。拉起是有界的：同一份凭证最多尝试 3 次（立即 / 5 分钟后 / 15 分钟后），用完即停并提示「打开一次 Claude Code」；凭证文件变化、托盘「立即刷新」或重启会重置计数。CLI 查找覆盖 PATH 上的 `claude.exe` / `claude.cmd`、npm 全局目录与 `~/.local/bin`。
 - Codex：`~/.codex/auth.json` + ChatGPT 用量接口。
 - Cursor：粘贴浏览器 Cookie 后读取个人套餐用量。
 
@@ -90,7 +90,7 @@ Taskbar-embedded AppBar:
 - Polling floor of 120 s for the Claude usage API with exponential back-off (up to 15 min) on 429.
 
 ### Data sources
-- Claude: OAuth token from `~/.claude/.credentials.json` against `https://api.anthropic.com/api/oauth/usage`. Expired or rejected tokens are refreshed through the Claude Code CLI's headless `get_usage` control request; the monitor never touches the refresh token, so it cannot break your Claude Code login.
+- Claude: OAuth token from `~/.claude/.credentials.json` against `https://api.anthropic.com/api/oauth/usage`. Expired or rejected tokens are refreshed by silently launching the Claude Code CLI (no console window) and asking it through its headless `get_usage` control request, which rewrites the credentials file; the monitor never touches the refresh token, so it cannot break your Claude Code login. Launches are bounded: at most 3 per credentials generation (now / +5 min / +15 min), then it stops and asks you to open Claude Code once; a changed credentials file, the tray "立即刷新" action, or a restart resets the counter. CLI lookup covers `claude.exe` / `claude.cmd` on PATH, the npm global directory and `~/.local/bin`.
 - Codex: `~/.codex/auth.json` + the ChatGPT usage endpoint.
 - Cursor: personal-plan usage via a pasted browser cookie.
 
@@ -110,7 +110,7 @@ Packaging the installer needs NSIS: run `build_installer.bat`.
 
 ### Diagnostics
 - Log: `%LOCALAPPDATA%\UsageMonitor\_runtime_logs\usage-monitor.log` (5 MB rotation; `USAGE_MONITOR_DEBUG=1` for Debug).
-- `usage-monitor.exe --probe` hits the usage endpoint once; `--probe --cli` exercises the Claude Code CLI refresh path.
+- `usage-monitor.exe --probe` hits the usage endpoint once; `--probe --cli` exercises the Claude Code CLI refresh path and reports which CLI was used and whether the credentials file was rewritten.
 
 ### Tech Stack
 - Rust 2021, Windows API (`windows` crate, GDI rendering)

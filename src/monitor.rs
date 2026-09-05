@@ -108,6 +108,21 @@ async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
                 s.claude_next_retry = Some(retry_at);
                 changed = true;
             }
+            Err(claude::FetchError::Expired { reason, next_attempt }) => {
+                // Token expired; the CLI refresh is bounded (see claude.rs). Keep the
+                // last-known rows as stale and show the reason + next attempt.
+                backoff = 0;
+                info!("[monitor] Claude: {} (next CLI attempt: {:?})", reason, next_attempt);
+                let mut s = state.lock();
+                let next_err = format!("Claude: {}", reason);
+                let stale = !s.claude.rows.is_empty();
+                if s.claude_error != next_err || s.claude_stale != stale || s.claude_next_retry != next_attempt {
+                    s.claude_error = next_err;
+                    s.claude_stale = stale;
+                    s.claude_next_retry = next_attempt;
+                    changed = true;
+                }
+            }
             Err(e) => {
                 backoff = 0;
                 error!("[monitor] Claude: {}", e);
