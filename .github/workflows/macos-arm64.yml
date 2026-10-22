@@ -1,0 +1,87 @@
+name: Apple Silicon update-enabled DMG
+on:
+  workflow_dispatch:
+    inputs:
+      update_channel:
+        description: Published channel to install during verification
+        type: choice
+        options: [stable, preview]
+        default: stable
+      update_from_version:
+        description: Optional exact public DMG version to upgrade from
+        type: string
+        default: ''
+      verify_published:
+        description: Verify public HTTPS feeds and perform an isolated Sparkle install
+        type: boolean
+        default: false
+      verify_only:
+        description: Test the exact public DMG without rebuilding
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    if: ${{ ! inputs.verify_only }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      MACOS_UPDATE_BASE_URL: https://github.com/ChoseWay/UsageMonitor-macOS-releases/releases/download
+      MACOS_UPDATE_FEED_BASE_URL: https://raw.githubusercontent.com/ChoseWay/UsageMonitor-macOS-releases/main
+      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+      SPARKLE_KEYCHAIN_ACCOUNT: usage-monitor
+      MACOS_ALLOW_ADHOC_UPDATES: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify native runner
+        run: test "$(uname -m)" = arm64
+      - name: Prepare Rust target
+        run: rustup target add aarch64-apple-darwin
+      - name: Build and test update-enabled development DMG
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: bash scripts/build-macos.sh
+      - name: Render native UI fixtures without provider access
+        run: |
+          APP=$(find dist/macos-arm64 -type d -name "Usage Monitor.app" -print -quit)
+          "$APP/Contents/MacOS/UsageMonitorUI" --ui-self-test "$PWD/dist/macos-arm64/ui-preview"
+      - name: Check private collector lifecycle
+        run: python3 scripts/test-bridge.py target/aarch64-apple-darwin/release/usage-monitor-core
+      - name: Check Sparkle feed format
+        run: python3 scripts/test-appcast.py
+      - name: Verify packaged disk image and signed updates
+        env:
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: bash scripts/test-macos-package.sh
+      - name: Check public HTTPS feeds and install through Sparkle
+        if: ${{ inputs.verify_published }}
+        env:
+          MACOS_UPDATE_CHANNEL: ${{ inputs.update_channel }}
+        run: bash scripts/test-macos-updates.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-updates
+          path: |
+            dist/macos-arm64/*.dmg
+            dist/macos-arm64/*.zip
+            dist/macos-arm64/*.sha256
+            dist/macos-arm64/*.xml
+            dist/macos-arm64/ui-preview/*.png
+          if-no-files-found: error
+          retention-days: 30
+  published-update-test:
+    if: ${{ inputs.verify_only }}
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      MACOS_UPDATE_BASE_URL: https://github.com/ChoseWay/UsageMonitor-macOS-releases/releases/download
+      MACOS_UPDATE_FEED_BASE_URL: https://raw.githubusercontent.com/ChoseWay/UsageMonitor-macOS-releases/main
+      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact public DMG and real Sparkle install
+        env:
+          MACOS_UPDATE_CHANNEL: ${{ inputs.update_channel }}
+          MACOS_UPDATE_FROM_VERSION: ${{ inputs.update_from_version }}
+        run: bash scripts/verify-published-macos.sh

@@ -10,3 +10,11 @@ _runtime_logs/
 *.zip
 _Documentation/
 *-Setup.exe
+
+/dist/
+/.build-deps/
+__pycache__/
+
+# Local render / browser-check outputs
+/output/
+/.playwright-cli/

@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "usage-monitor"
-version = "0.5.3"
+version = "0.7.6"
 dependencies = [
  "chrono",
  "log",

@@ -4,11 +4,6 @@ use log::{error, info};
 use reqwest::Client;
 use std::{sync::Arc, sync::atomic::{AtomicU64, Ordering}, time::Duration};
 use tokio::{sync::Notify, time::sleep};
-use windows::Win32::{
-    Foundation::HWND,
-    UI::WindowsAndMessaging::{PostMessageW, WM_APP},
-};
-
 // ─── Global refresh control ───────────────────────────────────────────────────
 
 pub static CLAUDE_INTERVAL:  AtomicU64 = AtomicU64::new(60);
@@ -30,32 +25,48 @@ pub fn wake_pollers() {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn notify_repaint(hwnd: HWND) {
-    unsafe { let _ = PostMessageW(hwnd, WM_APP, None, None); }
+type Notifier = Arc<dyn Fn() + Send + Sync>;
+
+/// Drop cancels in-flight collectors and reaps their bounded CLI subprocesses.
+pub struct MonitorHandle {
+    stop: tokio::sync::watch::Sender<bool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for MonitorHandle {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+    }
 }
 
-// ─── Spawn ───────────────────────────────────────────────────────────────────
-
-pub fn spawn(state: SharedState, hwnd: HWND) {
-    let hwnd_usize = hwnd.0 as usize;
-    std::thread::spawn(move || {
+pub fn spawn(state: SharedState, notify: impl Fn() + Send + Sync + 'static) -> MonitorHandle {
+    let notify: Notifier = Arc::new(notify);
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let worker = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
+            .enable_all().build().expect("tokio runtime");
         rt.block_on(async move {
-            let hwnd = HWND(hwnd_usize as *mut _);
-            let client = Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .expect("HTTP client");
-            tokio::join!(
-                poll_claude(Arc::clone(&state), hwnd, client.clone()),
-                poll_codex(Arc::clone(&state),  hwnd, client.clone()),
-                poll_cursor(Arc::clone(&state), hwnd, client),
-            );
+            let client = Client::builder().timeout(Duration::from_secs(15)).build().expect("HTTP client");
+            tokio::select! {
+                _ = stopped.changed() => {},
+                _ = async {
+                    tokio::join!(
+                        poll_claude(Arc::clone(&state), Arc::clone(&notify), client.clone()),
+                        poll_codex(Arc::clone(&state), Arc::clone(&notify), client.clone()),
+                        poll_cursor(Arc::clone(&state), Arc::clone(&notify), client),
+                        async {
+                            #[cfg(windows)]
+                            crate::updater::poll(state, notify).await;
+                            #[cfg(not(windows))]
+                            std::future::pending::<()>().await;
+                        },
+                    );
+                } => {},
+            }
         });
+        rt.shutdown_timeout(Duration::from_secs(2));
     });
+    MonitorHandle { stop, worker: Some(worker) }
 }
 
 // ─── Pollers ─────────────────────────────────────────────────────────────────
@@ -67,9 +78,13 @@ const CLAUDE_MIN_INTERVAL: u64 = 120;
 const CLAUDE_BACKOFF_START: u64 = 240;
 const CLAUDE_BACKOFF_MAX:   u64 = 900;
 
-async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
+async fn poll_claude(state: SharedState, notify: Notifier, client: Client) {
     let mut backoff: u64 = 0;
     loop {
+        if !state.lock().settings.show_claude {
+            tokio::select! { _ = sleep(Duration::from_secs(60)) => {}, _ = WAKE_POLLERS.notified() => {} }
+            continue;
+        }
         info!("[monitor] polling Claude…");
         let mut changed = false;
         match claude::fetch(&client).await {
@@ -142,7 +157,7 @@ async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
             }
         }
         if changed {
-            notify_repaint(hwnd);
+            notify();
         }
         let secs = if backoff > 0 {
             backoff
@@ -156,14 +171,19 @@ async fn poll_claude(state: SharedState, hwnd: HWND, client: Client) {
     }
 }
 
-async fn poll_codex(state: SharedState, hwnd: HWND, client: Client) {
+async fn poll_codex(state: SharedState, notify: Notifier, client: Client) {
     sleep(Duration::from_secs(5)).await;
     loop {
+        if !state.lock().settings.show_codex {
+            tokio::select! { _ = sleep(Duration::from_secs(60)) => {}, _ = WAKE_POLLERS.notified() => {} }
+            continue;
+        }
         info!("[monitor] polling Codex…");
         let mut changed = false;
         match codex::fetch(&client).await {
-            Ok(usage) => {
+            Ok(mut usage) => {
                 let mut s = state.lock();
+                usage.retain_activity(&s.codex);
                 if s.codex != usage {
                     s.codex = usage;
                     changed = true;
@@ -184,7 +204,7 @@ async fn poll_codex(state: SharedState, hwnd: HWND, client: Client) {
             }
         }
         if changed {
-            notify_repaint(hwnd);
+            notify();
         }
         let secs = CODEX_INTERVAL.load(Ordering::Relaxed);
         tokio::select! {
@@ -194,7 +214,7 @@ async fn poll_codex(state: SharedState, hwnd: HWND, client: Client) {
     }
 }
 
-async fn poll_cursor(state: SharedState, hwnd: HWND, client: Client) {
+async fn poll_cursor(state: SharedState, notify: Notifier, client: Client) {
     // Stagger start by 10 s so all three pollers don't hit the network simultaneously.
     sleep(Duration::from_secs(10)).await;
     loop {
@@ -228,7 +248,7 @@ async fn poll_cursor(state: SharedState, hwnd: HWND, client: Client) {
             }
         }
 
-        if changed { notify_repaint(hwnd); }
+        if changed { notify(); }
         let secs = CURSOR_INTERVAL.load(Ordering::Relaxed);
         tokio::select! {
             _ = sleep(Duration::from_secs(secs)) => {}

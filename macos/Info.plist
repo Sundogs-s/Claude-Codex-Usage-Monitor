@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>com.choseway.usage-monitor</string>
+    <key>CFBundleName</key><string>Usage Monitor</string>
+    <key>CFBundleDisplayName</key><string>Usage Monitor</string>
+    <key>CFBundleExecutable</key><string>UsageMonitorUI</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.7.6</string>
+    <key>CFBundleVersion</key><string>0.7.6</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
+    <key>LSArchitecturePriority</key><array><string>arm64</string></array>
+    <key>SUEnableAutomaticChecks</key><true/>
+    <key>SUAutomaticallyUpdate</key><true/>
+    <key>SUUpdateCheckInterval</key><integer>3600</integer>
+    <key>SUVerifyUpdateBeforeExtraction</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+</dict></plist>

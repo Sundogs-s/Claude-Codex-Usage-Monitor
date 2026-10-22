@@ -99,21 +99,20 @@ struct ClaudeCredentials {
 // ─── Credential loading ──────────────────────────────────────────────────────
 
 fn home_dir() -> PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
+    crate::platform::home_dir()
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
-    let base = home_dir().join(".claude");
-    let appdata = std::env::var("APPDATA").unwrap_or_default();
-    vec![
-        base.join(".credentials.json"),
-        base.join("credentials.json"),
-        PathBuf::from(&appdata).join("Claude").join(".credentials.json"),
-        PathBuf::from(&appdata).join("Claude").join("credentials.json"),
-    ]
+    let base = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".claude"));
+    #[allow(unused_mut)]
+    let mut paths = vec![base.join(".credentials.json"), base.join("credentials.json")];
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let base = PathBuf::from(appdata).join("Claude");
+        paths.extend([base.join(".credentials.json"), base.join("credentials.json")]);
+    }
+    paths
 }
 
 struct LoadedToken {
@@ -145,9 +144,13 @@ fn tier_label(rate_limit_tier: Option<&str>, subscription: Option<&str>) -> Opti
 }
 
 fn load_token() -> Result<LoadedToken, FetchError> {
-    let (path, data) = candidate_paths()
+    #[cfg(target_os = "macos")]
+    let keychain = crate::platform::claude_keychain_credentials().map_err(FetchError::Auth)?;
+    #[cfg(not(target_os = "macos"))]
+    let keychain: Option<String> = None;
+    let (path, data) = keychain.map(|s| (PathBuf::from("macOS Keychain"), s)).or_else(|| candidate_paths()
         .into_iter()
-        .find_map(|p| std::fs::read_to_string(&p).ok().map(|d| (p, d)))
+        .find_map(|p| std::fs::read_to_string(&p).ok().map(|d| (p, d))))
         .ok_or_else(|| FetchError::Auth(
             "Claude credentials not found. Open Claude Code once to sign in.".to_string()))?;
 
@@ -163,11 +166,16 @@ fn load_token() -> Result<LoadedToken, FetchError> {
                    oauth.expires_at, oauth.rate_limit_tier);
             let tier = tier_label(oauth.rate_limit_tier.as_deref(), oauth.subscription_type.as_deref());
             return Ok(LoadedToken {
-                token: oauth.access_token,
+                token: oauth.access_token.clone(),
                 expires_at: oauth.expires_at,
                 is_api_key: false,
                 tier,
-                generation: (mtime, oauth.expires_at),
+                generation: (mtime.or_else(|| {
+                    use std::hash::{Hash, Hasher};
+                    let mut hash = std::collections::hash_map::DefaultHasher::new();
+                    oauth.access_token.hash(&mut hash);
+                    std::time::UNIX_EPOCH.checked_add(Duration::from_nanos(hash.finish()))
+                }), oauth.expires_at),
             });
         }
     }
@@ -374,6 +382,18 @@ struct CliExe {
 /// Locate the Claude Code CLI. Order: real executables (PATH, npm global
 /// node_modules, ~/.local/bin, ~/.claude/local), then `.cmd` shims on PATH.
 fn resolve_cli() -> Option<CliExe> {
+    if let Some(path) = std::env::var_os("USAGE_MONITOR_CLAUDE_CLI").map(PathBuf::from) {
+        return crate::platform::executable(&path).then_some(CliExe { path, is_cmd: false });
+    }
+    #[cfg(not(windows))]
+    {
+        let paths = crate::platform::executable_dirs().into_iter().map(|p| p.join("claude"))
+            .chain([home_dir().join(".claude/local/claude")]);
+        return paths.into_iter().find(|p| crate::platform::executable(p))
+            .map(|path| CliExe { path, is_cmd: false });
+    }
+    #[cfg(windows)]
+    {
     let home = home_dir();
     let appdata = PathBuf::from(std::env::var("APPDATA").unwrap_or_default());
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
@@ -392,6 +412,7 @@ fn resolve_cli() -> Option<CliExe> {
     let mut cmds: Vec<PathBuf> = path_dirs.iter().map(|d| d.join("claude.cmd")).collect();
     cmds.push(appdata.join("npm").join("claude.cmd"));
     cmds.into_iter().find(|p| p.is_file()).map(|p| CliExe { path: p, is_cmd: true })
+    }
 }
 
 // ─── Bounded refresh attempts ────────────────────────────────────────────────
@@ -531,6 +552,7 @@ async fn cli_get_usage() -> Result<CliOutcome, CliError> {
         c.args(cli_args);
         c
     };
+    if let Some(path) = crate::platform::child_path() { cmd.env("PATH", path); }
     cmd.current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -666,7 +688,10 @@ pub async fn fetch(client: &Client) -> Result<ClaudeUsage, FetchError> {
     let loaded = load_token()?;
 
     if loaded.is_api_key {
+        #[cfg(windows)]
         return fetch_via_messages(client, &loaded.token).await;
+        #[cfg(not(windows))]
+        return Err(FetchError::Auth("Claude API-key logins have no subscription quota; sign in with Claude Code OAuth".into()));
     }
 
     let tier = loaded.tier.clone();

@@ -18,10 +18,7 @@ use std::path::PathBuf;
 // ─── Cookie storage ──────────────────────────────────────────────────────────
 
 pub fn cookie_path() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("UsageMonitor")
-        .join("cursor_cookie.txt")
+    crate::platform::data_dir().join("cursor_cookie.txt")
 }
 
 /// Load the stored Cookie header string (trimmed, single line).
@@ -39,7 +36,7 @@ pub fn save_cookie(cookie: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("mkdir failed: {}", e))?;
     }
-    std::fs::write(&path, cookie.trim())
+    crate::platform::write_private(&path, cookie.trim().as_bytes())
         .map_err(|e| format!("write cookie failed: {}", e))
 }
 

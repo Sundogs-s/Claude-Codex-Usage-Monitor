@@ -6,7 +6,7 @@ Unicode True
 
 !define APP_NAME        "Usage Monitor"
 !define APP_EXE         "usage-monitor.exe"
-!define APP_VERSION     "0.5.3"
+!define APP_VERSION     "0.7.6"
 !define PUBLISHER       "Sundogs"
 !define INSTALL_DIR     "$PROGRAMFILES64\UsageMonitor"
 !define REG_KEY         "Software\Microsoft\Windows\CurrentVersion\Uninstall\UsageMonitor"
@@ -20,6 +20,17 @@ RequestExecutionLevel admin
 
 ; Modern UI
 !include "MUI2.nsh"
+!include "FileFunc.nsh"
+Var UpdateMode
+
+Function .onInit
+    StrCpy $UpdateMode 0
+    ${GetParameters} $R0
+    ClearErrors
+    ${GetOptions} $R0 "/UPDATE" $R1
+    IfErrors +2 0
+        StrCpy $UpdateMode 1
+FunctionEnd
 
 !define MUI_ABORTWARNING
 !define MUI_ICON   "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
@@ -61,7 +72,23 @@ Section "MainSection" SecMain
 
     SetOutPath "$INSTDIR"
     SetOverwrite on
+    StrCpy $R9 0
+    IfFileExists "$INSTDIR\${APP_EXE}" 0 write_program
+        ClearErrors
+        CopyFiles /SILENT "$INSTDIR\${APP_EXE}" "$INSTDIR\usage-monitor.previous.exe"
+        IfErrors backup_failed 0
+        StrCpy $R9 1
+    write_program:
+    ClearErrors
     File "target\release\${APP_EXE}"
+    IfErrors write_failed install_continue
+    backup_failed:
+        Abort "Cannot back up the existing executable."
+    write_failed:
+        StrCmp $R9 1 0 +2
+            CopyFiles /SILENT "$INSTDIR\usage-monitor.previous.exe" "$INSTDIR\${APP_EXE}"
+        Abort "Cannot install the update; previous executable retained."
+    install_continue:
 
     ; Uninstall registry entries
     WriteRegStr   HKLM "${REG_KEY}" "DisplayName"      "${APP_NAME}"
@@ -92,7 +119,9 @@ SectionEnd
 
 ; Launch after install
 Section -Post
+    StrCmp $UpdateMode 1 post_done
     Exec '"$INSTDIR\${APP_EXE}"'
+    post_done:
 SectionEnd
 
 ; ----------------------------------------------------------------------------
@@ -111,6 +140,7 @@ Section "Uninstall"
 
     ; Remove files
     Delete "$INSTDIR\${APP_EXE}"
+    Delete "$INSTDIR\usage-monitor.previous.exe"
     Delete "$INSTDIR\Uninstall.exe"
     RMDir  "$INSTDIR"
 

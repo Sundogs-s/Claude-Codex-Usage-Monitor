@@ -1,5 +1,5 @@
 /// Shared application state — updated by background monitor thread,
-/// read by the Win32 WM_PAINT handler.
+/// read by the native Windows/macOS clients.
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -7,12 +7,33 @@ use std::sync::Arc;
 
 // ─── Usage data ──────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexWindow {
+    pub label: String,
+    pub minutes: u64,
+    pub utilization: f32,
+    pub reset: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DailyTokens {
+    pub date: String,
+    pub tokens: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct WindowUsage {
-    pub utilization_5h: Option<f32>,
-    pub utilization_7d: Option<f32>,
-    pub reset_5h:       Option<DateTime<Utc>>,
-    pub reset_7d:       Option<DateTime<Utc>>,
+pub struct CodexUsage {
+    pub windows: Vec<CodexWindow>,
+    pub plan: Option<String>,
+    pub account_id: Option<String>,
+    pub credits: Option<String>,
+    pub reset_count: Option<u64>,
+    pub limit_reached: bool,
+    pub daily: Option<Vec<DailyTokens>>,
+    pub lifetime_tokens: Option<u64>,
+    pub fetched_at: Option<DateTime<Utc>>,
+    pub activity_fetched_at: Option<DateTime<Utc>>,
+    pub activity_error: Option<String>,
 }
 
 /// One rate-limit window row (e.g. "5h", "7d", "Fable").
@@ -88,12 +109,14 @@ pub enum Theme {
     Classic,
     /// v0.5 "Neon HUD": 8px pixel grid, segmented glowing bars, cyan structure lines.
     Neon,
+    /// ChoseWay unified native dashboard.
+    ChoseWay,
 }
-impl Default for Theme { fn default() -> Self { Self::Neon } }
+impl Default for Theme { fn default() -> Self { Self::ChoseWay } }
 impl Theme {
     /// Default floating-window width for the theme (used when `win_w` is -1 = auto).
     pub fn default_width(self) -> i32 {
-        match self { Theme::Classic => 320, Theme::Neon => 240 }
+        match self { Theme::Classic => 320, Theme::Neon => 240, Theme::ChoseWay => 640 }
     }
 }
 
@@ -112,6 +135,10 @@ pub struct Settings {
     pub display_mode:    DisplayMode,
     #[serde(default)]
     pub theme:           Theme,
+    #[serde(default)]
+    pub ui_revision: u32,
+    #[serde(default = "default_true")]
+    pub mini_progress: bool,
     /// Index into the monitor list (0 = primary).
     #[serde(default)]
     pub monitor_idx:     usize,
@@ -119,6 +146,12 @@ pub struct Settings {
     pub refresh_rate:    RefreshRate,
     #[serde(default)]
     pub auto_start:      bool,
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
+    #[serde(default)]
+    pub update_preview: bool,
+    #[serde(default = "default_update_root")]
+    pub update_root: String,
     /// Whether the floating window shows a taskbar button.
     #[serde(default)]
     pub show_in_taskbar: bool,
@@ -146,6 +179,12 @@ pub struct Settings {
     pub win_h: i32,
 }
 
+fn default_update_root() -> String {
+    #[cfg(windows)]
+    { std::env::var("USAGE_MONITOR_RELEASE_ROOT").unwrap_or_else(|_| crate::updater::default_root()) }
+    #[cfg(not(windows))]
+    { String::new() }
+}
 fn default_true()  -> bool { true }
 fn default_neg()   -> i32  { -1 }
 fn default_win_w() -> i32  { -1 }
@@ -159,10 +198,14 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             display_mode:    DisplayMode::Floating,
-            theme:           Theme::Neon,
+            theme:           Theme::ChoseWay,
+            ui_revision: 1, mini_progress: true,
             monitor_idx:     0,
             refresh_rate:    RefreshRate::Min1,
             auto_start:      false,
+            auto_update_check: true,
+            update_preview: false,
+            update_root: default_update_root(),
             show_in_taskbar: false,
             hover_auto_hide: false,
             show_claude:     true,
@@ -219,6 +262,7 @@ pub fn neon_section_height(rows: usize) -> i32 {
 pub struct LayoutInfo {
     /// Number of rows in the Claude section (>= 2).
     pub claude_rows: usize,
+    pub codex_rows: usize,
     /// Whether a bottom banner (stale / error text) is shown.
     pub banner:      bool,
 }
@@ -228,11 +272,14 @@ pub struct LayoutInfo {
 pub const APPBAR_COL_W:        i32 = 180;
 pub const APPBAR_CLAUDE_COL_W: i32 = 200;
 pub const NEON_APPBAR_COL_W:   i32 = 176;
+/// ChoseWay: icon + up to two rows of label / 3px micro bar / percentage.
+pub const CHOSEWAY_APPBAR_COL_W: i32 = 144;
 
 pub fn appbar_col_widths(settings: &Settings) -> Vec<i32> {
     let (claude_w, other_w) = match settings.theme {
         Theme::Classic => (APPBAR_CLAUDE_COL_W, APPBAR_COL_W),
         Theme::Neon    => (NEON_APPBAR_COL_W, NEON_APPBAR_COL_W),
+        Theme::ChoseWay => (CHOSEWAY_APPBAR_COL_W, CHOSEWAY_APPBAR_COL_W),
     };
     let mut v = Vec::new();
     if settings.show_claude { v.push(claude_w); }
@@ -244,12 +291,13 @@ pub fn appbar_col_widths(settings: &Settings) -> Vec<i32> {
 /// Compute the preferred floating-window height for the currently enabled sections.
 /// Returns at least 96 (MIN_H) so the window is never empty.
 pub fn calc_window_height(settings: &Settings, layout: LayoutInfo) -> i32 {
+    if settings.theme == Theme::ChoseWay { return 590.max(230 + layout.claude_rows.max(layout.codex_rows) as i32 * 46); }
     let neon = settings.theme == Theme::Neon;
     let sec_h = |rows: usize| if neon { neon_section_height(rows) } else { section_height(rows) };
 
     let mut heights: Vec<i32> = Vec::new();
     if settings.show_claude { heights.push(sec_h(layout.claude_rows)); }
-    if settings.show_codex  { heights.push(sec_h(2)); }
+    if settings.show_codex  { heights.push(sec_h(layout.codex_rows)); }
     if settings.show_cursor { heights.push(sec_h(2)); }
 
     let n = heights.len() as i32;
@@ -275,14 +323,18 @@ pub struct MonitorInfo {
     pub rect:      (i32, i32, i32, i32),  // left, top, right, bottom
     /// Work area (excluding taskbar).
     pub work_rect: (i32, i32, i32, i32),
+    /// Windows primary display; enumeration lists it first.
+    pub primary:   bool,
 }
 
 // ─── App state ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
 pub struct AppState {
+    #[cfg(windows)]
+    pub update: crate::updater::UpdateState,
     pub claude:        ClaudeUsage,
-    pub codex:         WindowUsage,
+    pub codex:         CodexUsage,
     pub cursor:        CursorUsage,
     /// Claude rows are the last-known values; the usage API is currently rate-limited.
     pub claude_stale:  bool,
@@ -292,6 +344,10 @@ pub struct AppState {
     pub codex_error:   String,
     pub cursor_error:  String,
     pub floating_hover_hidden: bool,
+    pub settings_open: bool,
+    pub ui_focus: usize,
+    pub ui_hover: Option<u32>,
+    pub ui_notice: String,
     pub settings:      Settings,
     pub monitors:      Vec<MonitorInfo>,
 }
@@ -304,7 +360,7 @@ impl AppState {
             && (self.claude_stale || !self.claude_error.is_empty());
         let other_banner = (self.settings.show_codex && !self.codex_error.is_empty())
             || (self.settings.show_cursor && !self.cursor_error.is_empty());
-        LayoutInfo { claude_rows, banner: claude_banner || other_banner }
+        LayoutInfo { claude_rows, codex_rows: self.codex.display_rows().len(), banner: claude_banner || other_banner }
     }
 }
 
@@ -317,16 +373,17 @@ pub fn new_shared() -> SharedState {
 // ─── Settings persistence ─────────────────────────────────────────────────────
 
 pub fn settings_path() -> std::path::PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(appdata)
-        .join("UsageMonitor")
-        .join("settings.json")
+    crate::platform::data_dir().join("settings.json")
 }
 
 pub fn load_settings() -> Settings {
     let path = settings_path();
     if let Ok(data) = std::fs::read_to_string(&path) {
-        if let Ok(s) = serde_json::from_str::<Settings>(&data) {
+        if let Ok(mut s) = serde_json::from_str::<Settings>(&data) {
+            if s.ui_revision < 1 {
+                s.ui_revision = 1; s.theme = Theme::ChoseWay; s.win_w = -1; s.win_h = -1;
+                save_settings(&s);
+            }
             return s;
         }
     }
@@ -337,7 +394,7 @@ pub fn save_settings(s: &Settings) {
     let path = settings_path();
     if let Some(p) = path.parent() { let _ = std::fs::create_dir_all(p); }
     if let Ok(json) = serde_json::to_string_pretty(s) {
-        let _ = std::fs::write(&path, json);
+        let _ = crate::platform::write_private(&path, json.as_bytes());
     }
 }
 

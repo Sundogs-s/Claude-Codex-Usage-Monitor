@@ -146,11 +146,20 @@ fn display_face() -> &'static [u16] {
 
 // ─── Row / section models shared by the three painters ───────────────────────
 
+#[path = "overlay_summary.rs"]
+mod summary;
+#[path = "overlay_choseway.rs"]
+pub mod choseway;
+#[path = "overlay_popup.rs"]
+pub mod popup;
+
 #[derive(Clone)]
 struct RowDef {
     label: String,
     util:  Option<f32>,
     secs:  i64,
+    text: Option<String>,
+    summary: Option<summary::DockSummary>,
 }
 
 struct SectionDef {
@@ -171,14 +180,15 @@ struct SectionDef {
 fn claude_rows(state: &AppState) -> Vec<RowDef> {
     if state.claude.rows.is_empty() {
         return vec![
-            RowDef { label: "5h".into(), util: None, secs: 0 },
-            RowDef { label: "7d".into(), util: None, secs: 0 },
+            RowDef { label: "5h".into(), util: None, secs: 0, text: None, summary: None },
+            RowDef { label: "7d".into(), util: None, secs: 0, text: None, summary: None },
         ];
     }
     state.claude.rows.iter().map(|r| RowDef {
         label: r.label.clone(),
         util:  r.util_or_none(),
         secs:  secs_until(r.reset),
+        text: None, summary: None,
     }).collect()
 }
 
@@ -213,17 +223,26 @@ fn claude_meta(state: &AppState) -> (String, u32) {
 }
 
 fn codex_rows(state: &AppState) -> Vec<RowDef> {
-    vec![
-        RowDef { label: "5h".into(), util: state.codex.utilization_5h, secs: secs_until(state.codex.reset_5h) },
-        RowDef { label: "7d".into(), util: state.codex.utilization_7d, secs: secs_until(state.codex.reset_7d) },
-    ]
+    state.codex.display_rows().into_iter().map(|r| RowDef {
+        label: r.label, util: r.utilization, secs: secs_until(r.reset), text: r.value, summary: None,
+    }).collect()
+}
+
+fn codex_meta(state: &AppState) -> String {
+    let suffix = if !state.codex_error.is_empty() { "stale" }
+        else if state.codex.limit_reached { "limited" }
+        else if state.codex.activity_error.is_some() { "partial" }
+        else { "" };
+    format!("{} {} {}", state.codex.plan_label(),
+        fmt_age(state.codex.fetched_at.map(|t| (chrono::Utc::now() - t).num_seconds().max(0))), suffix)
+        .trim().to_string()
 }
 
 fn cursor_rows(state: &AppState) -> Vec<RowDef> {
     let reset_secs = secs_until(state.cursor.reset_date);
     vec![
-        RowDef { label: "AUTO".into(), util: state.cursor.auto_usage_pct, secs: reset_secs },
-        RowDef { label: "API".into(),  util: state.cursor.api_usage_pct,  secs: reset_secs },
+        RowDef { label: "AUTO".into(), util: state.cursor.auto_usage_pct, secs: reset_secs, text: None, summary: None },
+        RowDef { label: "API".into(),  util: state.cursor.api_usage_pct,  secs: reset_secs, text: None, summary: None },
     ]
 }
 
@@ -273,17 +292,17 @@ fn row_colors(util: Option<f32>, hi: u32, mid: u32, lo: u32, dim: bool) -> (u32,
 static THEME: AtomicU8 = AtomicU8::new(1); // 0 = Classic, 1 = Neon
 
 pub fn set_theme(t: Theme) {
-    THEME.store(if t == Theme::Neon { 1 } else { 0 }, Ordering::Relaxed);
+    THEME.store(match t { Theme::Classic=>0, Theme::Neon=>1, Theme::ChoseWay=>2 }, Ordering::Relaxed);
 }
 
-fn current_theme() -> Theme {
-    if THEME.load(Ordering::Relaxed) == 1 { Theme::Neon } else { Theme::Classic }
+pub fn current_theme() -> Theme {
+    match THEME.load(Ordering::Relaxed) {1=>Theme::Neon,2=>Theme::ChoseWay,_=>Theme::Classic}
 }
 
 // ─── Window region: rounded 14px for Classic, square for Neon ─────────────────
 pub fn apply_rounded_region(hwnd: HWND, w: i32, h: i32) {
     unsafe {
-        let r = if current_theme() == Theme::Neon { 0 } else { 14 };
+        let r = match current_theme() { Theme::Neon=>0,Theme::ChoseWay=>(44.0*crate::windows_app::ui_scale(hwnd)).round() as i32,_=>14 };
         let hrgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, r, r);
         SetWindowRgn(hwnd, hrgn, true);
     }
@@ -292,13 +311,14 @@ pub fn apply_rounded_region(hwnd: HWND, w: i32, h: i32) {
 // ─── Public paint entry ───────────────────────────────────────────────────────
 pub fn paint(hwnd: HWND, state: &AppState) {
     debug!(
-        "[paint] theme={:?} c5h={:?} c7d={:?} stale={} | x5h={:?} x7d={:?}",
+        "[paint] theme={:?} c5h={:?} c7d={:?} stale={} | codex_primary={:?} codex_secondary={:?}",
         state.settings.theme,
         state.claude.util("5h"), state.claude.util("7d"), state.claude_stale,
-        state.codex.utilization_5h,  state.codex.utilization_7d,
+        state.codex.primary_utilization(),  state.codex.windows.get(1).map(|w| w.utilization),
     );
     unsafe {
         match (state.settings.theme, state.settings.display_mode) {
+            (Theme::ChoseWay, mode) => choseway::paint(hwnd,state,mode==DisplayMode::AppBar,crate::windows_app::ui_scale(hwnd)),
             (Theme::Neon, DisplayMode::AppBar) => paint_appbar_neon(hwnd, state),
             (Theme::Neon, _)                   => paint_floating_neon(hwnd, state),
             (Theme::Classic, DisplayMode::Floating)   => paint_floating(hwnd, state),
@@ -373,7 +393,7 @@ unsafe fn paint_floating(hwnd: HWND, state: &AppState) {
         sections.push(SectionDef {
             name: "Codex", hi: CODEX_HI, mid: CODEX_MID, lo: CODEX_LO,
             rows: codex_rows(state),
-            meta: String::new(), meta_col: TEXT_DIM, dim: false,
+            meta: codex_meta(state), meta_col: TEXT_DIM, dim: !state.codex_error.is_empty(),
             is_cursor: false,
         });
     }
@@ -446,7 +466,7 @@ unsafe fn draw_float_section(
     let pad_x   = 14i32;
     let pad_top =  8i32;
     let wide_labels = sec.rows.iter().any(|r| r.label.chars().count() > 2);
-    let label_w = if wide_labels { 40i32 } else { 16i32 };
+    let label_w = if wide_labels { (sec.rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(4) as i32 * 7).clamp(40, 72) } else { 16i32 };
     let pct_w   = 40i32;
     let eta_w   = 44i32;
     let bar_h   =  8i32;
@@ -508,6 +528,16 @@ unsafe fn draw_float_section(
         gdi_text(hdc, &r.label, content_x, y, label_w, row_h,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
+        if let Some(value) = &r.text {
+            SetTextColor(hdc, rgb(if sec.dim { TEXT_DIM } else { TEXT_PRIMARY }));
+            gdi_text(hdc, value, bx, y, content_x + content_w - bx, row_h,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, old2);
+            DeleteObject(hfm);
+            y += row_h + row_gap;
+            continue;
+        }
+
         // Bar track
         gdi_rrect(hdc, bx, by, bar_w, bar_h, bar_r, BAR_TRACK);
         // Bar fill
@@ -555,7 +585,7 @@ unsafe fn paint_appbar(hwnd: HWND, state: &AppState) {
             "[paint_appbar] count={} hwnd={:?} size={}x{} claude={} codex={} cursor={} c5h={:?} x5h={:?} cr={:?}",
             n, hwnd, w, h,
             state.settings.show_claude, state.settings.show_codex, state.settings.show_cursor,
-            state.claude.util("5h"), state.codex.utilization_5h,
+            state.claude.util("5h"), state.codex.primary_utilization(),
             state.cursor.auto_usage_pct,
         );
     }
@@ -584,7 +614,7 @@ unsafe fn paint_appbar(hwnd: HWND, state: &AppState) {
     let widths = appbar_col_widths(&state.settings);
     let mut cols: Vec<(u32, u32, u32, u32, Vec<RowDef>, bool)> = Vec::new(); // hi, mid, lo, stripe, rows, dim
     if show_claude { cols.push((CLAUDE_HI, CLAUDE_MID, CLAUDE_LO, CLAUDE_HI, claude_rows(state), state.claude_stale)); }
-    if show_codex  { cols.push((CODEX_HI,  CODEX_MID,  CODEX_LO,  CODEX_HI,  codex_rows(state),  false)); }
+    if show_codex  { cols.push((CODEX_HI,  CODEX_MID,  CODEX_LO,  CODEX_HI,  codex_rows(state),  !state.codex_error.is_empty())); }
     if show_cursor { cols.push((CURSOR_HI, CURSOR_MID, CURSOR_LO, CURSOR_STRIPE, cursor_rows(state), false)); }
 
     let mut x_off = 0i32;
@@ -659,6 +689,11 @@ unsafe fn draw_dock_side(
     hi: u32, mid: u32, lo: u32, stripe_color: u32,
     rows: &[RowDef], dim: bool,
 ) {
+    let rows = summary::dock_rows(rows);
+    if rows.iter().any(|r| r.summary.is_some()) {
+        summary::draw_classic_dock(hdc, fn_mono, &rows, x, col_w, h, hi, mid, lo, stripe_color, dim);
+        return;
+    }
     let scale = (h.max(1) as f32) / 40.0;
     let sc = |v: i32| ((v as f32) * scale).round().max(1.0) as i32;
 
@@ -668,7 +703,7 @@ unsafe fn draw_dock_side(
     let stripe_gap = sc(4);
     // "5h"/"7d" fit in ~26px; "AUTO"/"Fable" (4–5 chars at ~6–9px each) need up to ~46px.
     let wide_labels = rows.iter().any(|r| r.label.chars().count() > 2);
-    let label_w    = if wide_labels { sc(30).clamp(30, 46) } else { sc(16).clamp(26, 36) };
+    let label_w    = if wide_labels { sc((rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(4) as i32 * 5 + 4).clamp(30, 56)) } else { sc(16).clamp(26, 36) };
     let pct_w      = sc(26).clamp(24, 34);
     let eta_w      = sc(30).clamp(28, 40);
     let bar_h      = sc(5).max(3);
@@ -694,6 +729,14 @@ unsafe fn draw_dock_side(
                  rows_area_x, row_y - 2, label_w, bar_h + 4,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
+        if let Some(value) = &r.text {
+            SetTextColor(hdc, rgb(if dim { TEXT_DIM } else { TEXT_PRIMARY }));
+            gdi_text(hdc, value, bx, row_y - 2, x + col_w - pad - bx, bar_h + 4,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, old2);
+            DeleteObject(hfm);
+            continue;
+        }
         gdi_rrect(hdc, bx, row_y, bar_w, bar_h, 2, BAR_TRACK);
         let fw = r.util.map(|u| ((u * bar_w as f32) as i32).max(0).min(bar_w)).unwrap_or(0);
         if fw > 0 {
@@ -763,7 +806,7 @@ unsafe fn paint_compact(hwnd: HWND, state: &AppState) {
         draw_compact_half(hdc, &fn_bold, &fn_norm, fh,
             x_off + pad, 0, half - pad * 2, h,
             "◆ X", CODEX_HI, CODEX_MID, CODEX_LO,
-            &codex_rows(state), false,
+            &codex_rows(state), !state.codex_error.is_empty(),
             bw, bh);
     }
 
@@ -805,6 +848,12 @@ unsafe fn draw_compact_half(
         SetTextColor(hdc, rgb(TEXT_DIM));
         gdi_text(hdc, &r.label, lx, ry, label_w, pitch, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
+        if let Some(value) = &r.text {
+            SetTextColor(hdc, rgb(TEXT_DIM));
+            gdi_text(hdc, value, bx, ry, bw + 84, pitch,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            continue;
+        }
         gdi_rrect(hdc, bx, by, bw, bh, 2, BAR_TRACK);
         let fw = r.util.map(|u| ((u * bw as f32) as i32).max(0).min(bw)).unwrap_or(0);
         if fw > 0 {
@@ -890,6 +939,16 @@ pub fn create_tray_icon_hicon(
             gdi_grad_bar(hdc_mem, pad, y_bot, xw, bh, blo, bmid, bhi);
         }
 
+        if current_theme()==Theme::ChoseWay {
+            gdi_fill(hdc_mem,0,0,size,size,0x121212);
+            for (used,y) in [(claude_5h,y_top),(codex_5h,y_bot)] {
+                gdi_rrect(hdc_mem,pad,y,iw,bh,bh/2,0x303030);
+                if let Some(used)=used {
+                    let width=(used.clamp(0.0,1.0)*iw as f32).round()as i32;
+                    if width>0{gdi_rrect(hdc_mem,pad,y,width,bh,bh/2,if used>=1.0{0xFF3748}else if used>=0.8{0xD9A13B}else{0xF4EFE9});}
+                } else {gdi_fill(hdc_mem,pad,y+bh/2,iw,1,0x898582);}
+            }
+        }
         // Mask bitmap: all black = fully opaque
         SelectObject(hdc_mem, hbm_mask);
         PatBlt(hdc_mem, 0, 0, size, size, BLACKNESS);
@@ -1217,7 +1276,7 @@ fn neon_sections(state: &AppState) -> Vec<SectionDef> {
         let (lo, hi) = neon::CODEX;
         sections.push(SectionDef {
             name: "Codex", hi, mid: hi, lo, rows: codex_rows(state),
-            meta: String::new(), meta_col: neon::DIM, dim: false, is_cursor: false,
+            meta: codex_meta(state), meta_col: neon::DIM, dim: !state.codex_error.is_empty(), is_cursor: false,
         });
     }
     if st.show_cursor {
@@ -1355,7 +1414,7 @@ unsafe fn draw_neon_section(hdc: HDC, fn_disp: &[u16], fn_mono: &[u16],
     y += NEON_HEAD_H;
 
     // Rows: label 32 | bar (flex, 80 at 240 wide) | pct 32 | eta 40, gaps 8
-    let label_w = 32;
+    let label_w = (sec.rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(4) as i32 * 6 + 4).clamp(32, 72);
     let pct_w   = 32;
     let eta_w   = 40;
     let gap     = 8;
@@ -1373,6 +1432,16 @@ unsafe fn draw_neon_section(hdc: HDC, fn_disp: &[u16], fn_mono: &[u16],
         SetTextColor(hdc, rgb(if sec.dim { blend(LABEL, BG, 0.35) } else { LABEL }));
         gdi_text(hdc, &r.label.to_uppercase(), x0, y, label_w, NEON_ROW_H,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        if let Some(value) = &r.text {
+            SelectObject(hdc, hfp);
+            SetTextColor(hdc, rgb(if sec.dim { DIM } else { PCT }));
+            gdi_text(hdc, value, bar_x, y, x0 + cw - bar_x, NEON_ROW_H,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, old);
+            y += NEON_ROW_H;
+            continue;
+        }
 
         let warn = r.util.unwrap_or(0.0) >= 0.80;
         let (lo, hi) = if warn { (blend(WARN, BG, 0.3), WARN) } else { (sec.lo, sec.hi) };
@@ -1410,6 +1479,9 @@ unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
     GetClientRect(hwnd, &mut rc).ok();
     let w = rc.right;
     let h = rc.bottom;
+
+    let n = APPBAR_PAINT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 120 == 1 { info!("[paint_appbar] theme=Neon count={} hwnd={:?} size={}x{}", n, hwnd, w, h); }
 
     let scale = (h.max(1) as f32) / 40.0;
     let fn_mono = mono_face().to_vec();
@@ -1450,6 +1522,8 @@ unsafe fn paint_appbar_neon(hwnd: HWND, state: &AppState) {
 unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i32,
                              sec: &SectionDef, bg: u32) {
     use neon::*;
+    let rows = summary::dock_rows(&sec.rows);
+    let has_summary = rows.iter().any(|r| r.summary.is_some());
     let scale = (h.max(1) as f32) / 40.0;
     let sc = |v: i32| ((v as f32) * scale).round().max(1.0) as i32;
 
@@ -1459,16 +1533,16 @@ unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i
     gdi_fill(hdc, x + stripe_w + sc(2), 0, sc(1), h, blend(sec.hi, bg, 0.88));
     neon_vgrad(hdc, x, 0, stripe_w, h, sec.hi, sec.lo);
 
-    let label_w = sc(28);
-    let pct_w   = sc(28);
+    let label_w = sc((rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(4) as i32 * 5 + 4).clamp(if has_summary { 18 } else { 28 }, 56));
+    let pct_w   = sc(if has_summary { 38 } else { 28 });
     let eta_w   = sc(32);
     let gap     = sc(4);
-    let row_h   = sc(9);
+    let row_h   = sc(if has_summary { 14 } else { 9 });
     let bar_h   = sc(5);
     let seg_w   = sc(3);
     let seg_gap = sc(1);
-    let n       = sec.rows.len() as i32;
-    let rgap    = if n >= 3 { sc(3) } else { sc(7) };
+    let n       = rows.len() as i32;
+    let rgap    = if n >= 3 { sc(3) } else if has_summary { sc(4) } else { sc(7) };
 
     let rx    = x + stripe_w + sc(9);
     let right = x + col_w - sc(8);
@@ -1480,15 +1554,32 @@ unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i
     let total = n * row_h + (n - 1).max(0) * rgap;
     let mut y = (h - total) / 2;
 
-    let hfl = make_font_weight(fn_mono, -sc(9), 400);
-    let hfp = make_font_weight(fn_mono, -sc(9), 600);
-    let hfe = make_font_weight(fn_mono, -sc(8), 400);
+    let hfl = make_font_weight(fn_mono, -sc(if has_summary { 10 } else { 9 }), 400);
+    let hfp = make_font_weight(fn_mono, -sc(if has_summary { 12 } else { 9 }), 700);
+    let hfe = make_font_weight(fn_mono, -sc(if has_summary { 9 } else { 8 }), 400);
 
-    for r in &sec.rows {
+    for r in &rows {
+        if let Some(s) = &r.summary {
+            summary::draw(hdc, fn_mono, s, summary::DockColumns {
+                bar_x, bar_w, pct_x, pct_w, eta_x, eta_w,
+            }, y - 1, row_h + 2, scale, sec.dim, bg);
+            y += row_h + rgap;
+            continue;
+        }
         let old = SelectObject(hdc, hfl);
         SetTextColor(hdc, rgb(if sec.dim { blend(LABEL, bg, 0.35) } else { LABEL }));
         gdi_text(hdc, &r.label.to_uppercase(), rx, y - 1, label_w, row_h + 2,
                  DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        if let Some(value) = &r.text {
+            SelectObject(hdc, hfp);
+            SetTextColor(hdc, rgb(if sec.dim { DIM } else { PCT }));
+            gdi_text(hdc, value, bar_x, y - 1, right - bar_x, row_h + 2,
+                     DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            SelectObject(hdc, old);
+            y += row_h + rgap;
+            continue;
+        }
 
         let warn = r.util.unwrap_or(0.0) >= 0.80;
         let (lo, hi) = if warn { (blend(WARN, bg, 0.3), WARN) } else { (sec.lo, sec.hi) };
@@ -1509,7 +1600,7 @@ unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i
         SelectObject(hdc, hfe);
         SetTextColor(hdc, rgb(DIM));
         gdi_text(hdc, &fmt_countdown(r.secs), eta_x, y - 1, eta_w, row_h + 2,
-                 DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                 (if has_summary { DT_RIGHT } else { DT_LEFT }) | DT_SINGLELINE | DT_VCENTER);
         SelectObject(hdc, old);
         y += row_h + rgap;
     }
@@ -1517,3 +1608,7 @@ unsafe fn draw_neon_dock_col(hdc: HDC, fn_mono: &[u16], x: i32, col_w: i32, h: i
     DeleteObject(hfp);
     DeleteObject(hfe);
 }
+
+#[cfg(test)]
+#[path = "overlay_tests.rs"]
+mod tests;
